@@ -15,6 +15,7 @@ export interface ContextOptions {
    * Level of context extraction for a given code block.
    * 0 => innermost function only (current behavior),
    * 1 => parent function, 2 => grandparent, etc.
+   * Max level = 50;
    */
   nestingLevel?: number; // default 0
 }
@@ -112,42 +113,36 @@ export class ContextExtractor {
    * It records incremental edits; we only re-parse on demand.
    */
   onModelContentChanged(e: monaco.editor.IModelContentChangedEvent) {
-    for (const change of e.changes) {
-      const start: Position = {
-        lineNumber: change.range.startLineNumber,
-        column: change.range.startColumn,
-      };
-      const end: Position = {
-        lineNumber: change.range.endLineNumber,
-        column: change.range.endColumn,
-      };
+    const changes = [...e.changes].sort(
+      (a, b) => a.rangeOffset - b.rangeOffset
+    );
 
-      // CHANGED: Use Monaco offsets directly (code units). No *2.
-      const startOffset = this.model.getOffsetAt(start);
-      const oldEndOffset = this.model.getOffsetAt(end);
-
-      // CHANGED: new end offset = start + inserted text length (code units)
-      const newEndOffset = startOffset + change.text.length;
-
+    for (const change of changes) {
+      // PRE-CHANGE positions (Monaco guarantees these are pre-change)
       const startPosition: Point = {
-        row: start.lineNumber - 1,
-        column: start.column - 1,
+        row: change.range.startLineNumber - 1,
+        column: change.range.startColumn - 1,
       };
       const oldEndPosition: Point = {
-        row: end.lineNumber - 1,
-        column: end.column - 1,
-      };
-      const newEndPos = this.model.getPositionAt(newEndOffset);
-      const newEndPosition: Point = {
-        row: newEndPos.lineNumber - 1,
-        column: newEndPos.column - 1,
+        row: change.range.endLineNumber - 1,
+        column: change.range.endColumn - 1,
       };
 
+      // PRE-CHANGE indices (use the event’s offsets, not model.getOffsetAt)
+      const startIndex = change.rangeOffset;
+      const oldEndIndex = change.rangeOffset + change.rangeLength;
+
+      // POST-CHANGE indices and positions derived from inserted text length
+      const newEndIndex = change.rangeOffset + change.text.length;
+      const newEndPosition = this.advancePointByText(
+        startPosition,
+        change.text
+      );
+
       this.pendingEdits.push({
-        // CHANGED: Pass offsets as-is (no bytes conversion)
-        startIndex: startOffset,
-        oldEndIndex: oldEndOffset,
-        newEndIndex: newEndOffset,
+        startIndex,
+        oldEndIndex,
+        newEndIndex,
         startPosition,
         oldEndPosition,
         newEndPosition,
@@ -155,6 +150,23 @@ export class ContextExtractor {
     }
 
     this.dirty = true;
+  }
+
+  // Add this helper somewhere private:
+  private advancePointByText(start: Point, text: string): Point {
+    // Count lines in the inserted text
+    const norm = text.replace(/\r\n?/g, "\n"); // ← normalize
+    const lines = norm.split("\n");
+    if (lines.length === 1) {
+      // single-line insert
+      return { row: start.row, column: start.column + lines[0].length };
+    }
+    // multi-line insert
+    const lastLine = lines[lines.length - 1];
+    return {
+      row: start.row + (lines.length - 1),
+      column: lastLine.length,
+    };
   }
 
   private wrapFunctionIfArgument(funcNode: Node): Node {
@@ -166,6 +178,22 @@ export class ContextExtractor {
       p = p.parent;
     }
     return funcNode;
+  }
+
+  private mergeRanges(
+    ranges: Array<{ startOffset: number; endOffset: number }>
+  ) {
+    const sorted = ranges.slice().sort((a, b) => a.startOffset - b.startOffset);
+    const out: typeof sorted = [];
+    for (const r of sorted) {
+      const last = out[out.length - 1];
+      if (!last || r.startOffset > last.endOffset) {
+        out.push({ ...r });
+      } else {
+        last.endOffset = Math.max(last.endOffset, r.endOffset);
+      }
+    }
+    return out;
   }
 
   /**
@@ -199,10 +227,8 @@ export class ContextExtractor {
     // 1) Try enclosing function-like block
     const innerFunc = this.nearestFunctionFrom(nodeAtCursor);
     if (innerFunc) {
-      const targetFunc = this.elevateFunctionByLevels(
-        innerFunc,
-        opts.nestingLevel || Infinity // Infinity to reach till global boundary
-      );
+      const nestingLevel = opts.nestingLevel ?? 0; // CHANGED: default to innermost
+      const targetFunc = this.elevateFunctionByLevels(innerFunc, nestingLevel);
 
       // Keep the behavior: if the selected function is used as an argument,
       // wrap to the call/new expression so we don’t miss the closing parens.
@@ -228,14 +254,17 @@ export class ContextExtractor {
       const prev = this.previousNamedSibling(topLevel);
       const next = this.nextNamedSibling(topLevel);
 
-      // If either sibling exists, collect them (excluding the current node itself).
+      // CHANGED: include the current top-level node too
       const blocks: Array<{ startOffset: number; endOffset: number }> = [];
+      blocks.push(this.expandNodeToFullLines(topLevel));
       if (prev) blocks.push(this.expandNodeToFullLines(prev));
       if (next) blocks.push(this.expandNodeToFullLines(next));
 
       if (blocks.length > 0) {
-        const startOffset = Math.min(...blocks.map((b) => b.startOffset));
-        const endOffset = Math.max(...blocks.map((b) => b.endOffset));
+        const merged = this.mergeRanges(blocks);
+        const startOffset = merged[0].startOffset;
+        const endOffset = merged[merged.length - 1].endOffset;
+
         return {
           text: this.model.getValueInRange({
             startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
@@ -317,9 +346,10 @@ export class ContextExtractor {
 
   private elevateFunctionByLevels(funcNode: Node, levels: number): Node {
     if (levels <= 0) return funcNode;
+    const safeLevels = Math.min(Math.max(levels, 0), 50);
     let current: Node = funcNode;
 
-    for (let i = 0; i < levels; i++) {
+    for (let i = 0; i < safeLevels; i++) {
       // Walk up until we find the *next* outer function-like ancestor
       let p: Node | null = current.parent;
       let promoted: Node | null = null;
@@ -346,32 +376,6 @@ export class ContextExtractor {
     }
 
     return current;
-  }
-
-  /** Find the nearest enclosing function-like node */
-  private findEnclosingFunctionLike(node: Node): Node | null {
-    let cur: Node | null = node;
-    while (cur) {
-      if (this.isFunctionLike(cur)) return cur;
-
-      // CHANGED: hop from body -> its function
-      if (
-        this.isFunctionBody(cur) &&
-        cur.parent &&
-        this.isFunctionLike(cur.parent)
-      ) {
-        return cur.parent;
-      }
-
-      // If inside a call's arguments, prefer a function argument
-      if (cur.type === "arguments") {
-        const fnArg = cur.namedChildren.find(this.isFunctionLike);
-        if (fnArg) return fnArg;
-      }
-
-      cur = cur.parent;
-    }
-    return null;
   }
 
   /** Return the highest ancestor that is a direct child of the root (i.e., a top-level statement) */

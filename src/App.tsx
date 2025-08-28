@@ -205,6 +205,7 @@ function App() {
       // Extract context using the context extractor
       const result = contextExtractor.current.getContextAroundCursor(position, {
         fallbackLineWindow: 6,
+        nestingLevel: 10,
       });
 
       // Display the extracted context
