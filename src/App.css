@@ -48,7 +48,6 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 1rem;
 }
 
 .cursor-display {
@@ -62,37 +61,8 @@
   padding: 0.5rem 1rem;
   border-radius: 6px;
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-  font-size: 0.9rem;
+  font-size: 12px;
   border: 1px solid #555;
-}
-
-.cursor-controls {
-  display: flex;
-  gap: 1rem;
-  align-items: center;
-}
-
-.cursor-controls label {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  color: #cccccc;
-  font-size: 0.9rem;
-}
-
-.cursor-input {
-  width: 60px;
-  padding: 0.25rem 0.5rem;
-  background: #3c3c3c;
-  border: 1px solid #555;
-  border-radius: 4px;
-  color: #ffffff;
-  font-size: 0.9rem;
-}
-
-.cursor-input:focus {
-  outline: none;
-  border-color: #007acc;
 }
 
 .extract-section {
@@ -266,4 +236,79 @@
   .editor-wrapper {
     height: 300px;
   }
+}
+
+/* Tree Status Styles */
+.tree-status {
+  padding: 0.75rem;
+  background: #2d2d30;
+  border-radius: 4px;
+  width: 100%;
+  border: 1px solid #3e3e42;
+}
+
+.tree-status-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.tree-status-label {
+  font-weight: 500;
+  color: #cccccc;
+  font-size: 0.9rem;
+}
+
+.sync-tree-button {
+  background: #007acc;
+  color: white;
+  border: none;
+  padding: 0.25rem 0.5rem;
+  border-radius: 3px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.sync-tree-button:hover {
+  background: #005a9e;
+}
+
+.tree-status-details {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+}
+
+.status-indicator {
+  padding: 0.2rem 0.5rem;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+.status-indicator.clean {
+  background: #1e7e34;
+  color: white;
+}
+
+.status-indicator.dirty {
+  background: #fd7e14;
+  color: white;
+}
+
+.pending-edits {
+  color: #ffc107;
+  font-weight: 500;
+}
+
+.last-parse {
+  color: #6c757d;
+}
+
+.stats-container {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
 }

@@ -12,6 +12,12 @@ function App() {
     strategy: string;
     totalChars: number;
   } | null>(null);
+  const [treeStatus, setTreeStatus] = useState<{
+    isDirty: boolean;
+    hasTree: boolean;
+    pendingEditsCount: number;
+    lastParseTime: number;
+  } | null>(null);
 
   // Monaco editor refs
   const inputEditorRef = useRef<HTMLDivElement>(null);
@@ -22,6 +28,40 @@ function App() {
     useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const contextExtractor = useRef<ContextExtractor | null>(null);
   const modelDisposable = useRef<monaco.IDisposable | null>(null);
+  const debounceTimeoutRef = useRef<number | null>(null);
+
+  // Update tree status
+  const updateTreeStatus = useCallback(() => {
+    if (contextExtractor.current) {
+      setTreeStatus(contextExtractor.current.getTreeStatus());
+    }
+  }, []);
+
+  // Debounced tree rebuild (500ms delay)
+  const debouncedRebuildTree = useCallback(() => {
+    if (debounceTimeoutRef.current) {
+      clearTimeout(debounceTimeoutRef.current);
+    }
+
+    debounceTimeoutRef.current = window.setTimeout(() => {
+      if (contextExtractor.current) {
+        contextExtractor.current.forceBuildTree();
+        updateTreeStatus();
+      }
+    }, 500);
+  }, [updateTreeStatus]);
+
+  // Manual tree sync
+  const syncTree = useCallback(() => {
+    if (contextExtractor.current) {
+      if (debounceTimeoutRef.current) {
+        clearTimeout(debounceTimeoutRef.current);
+        debounceTimeoutRef.current = null;
+      }
+      contextExtractor.current.forceBuildTree();
+      updateTreeStatus();
+    }
+  }, [updateTreeStatus]);
 
   // Initialize Monaco editors
   useEffect(() => {
@@ -85,10 +125,13 @@ function App() {
           // Remove the hardcoded WASM path parameter
           contextExtractor.current = await ContextExtractor.create(model);
           console.log("Context extractor initialized successfully");
+          updateTreeStatus(); // Initial status update
 
           modelDisposable.current = model.onDidChangeContent((e) => {
             if (contextExtractor.current) {
               contextExtractor.current.onModelContentChanged(e);
+              updateTreeStatus(); // Update status immediately
+              debouncedRebuildTree(); // Schedule debounced rebuild
             }
           });
         } catch (wasmError) {
@@ -109,11 +152,14 @@ function App() {
 
     // Cleanup
     return () => {
+      if (debounceTimeoutRef.current) {
+        clearTimeout(debounceTimeoutRef.current);
+      }
       modelDisposable.current?.dispose();
       inputEditorInstance.current?.dispose();
       outputEditorInstance.current?.dispose();
     };
-  }, []);
+  }, [updateTreeStatus, debouncedRebuildTree]);
 
   // Function for processing code using the context extractor
   const extractScript = useCallback(async () => {
@@ -248,23 +294,57 @@ function App() {
             <div className="success-message">{successMessage}</div>
           )}
 
-          {extractionStats && (
-            <div className="stats-section">
-              <h3>Context Extraction Statistics</h3>
-              <div className="stats-grid">
-                <div className="stat-item">
-                  <span className="stat-label">Strategy:</span>
-                  <span className="stat-value">{extractionStats.strategy}</span>
+          <div className="stats-container">
+            {extractionStats && (
+              <div className="stats-section">
+                <h3>Context Extraction Statistics</h3>
+                <div className="stats-grid">
+                  <div className="stat-item">
+                    <span className="stat-label">Strategy:</span>
+                    <span className="stat-value">
+                      {extractionStats.strategy}
+                    </span>
+                  </div>
+                  <div className="stat-item">
+                    <span className="stat-label">Characters:</span>
+                    <span className="stat-value">
+                      {extractionStats.totalChars}
+                    </span>
+                  </div>
                 </div>
-                <div className="stat-item">
-                  <span className="stat-label">Characters:</span>
-                  <span className="stat-value">
-                    {extractionStats.totalChars}
+              </div>
+            )}
+            {treeStatus && (
+              <div className="tree-status">
+                <div className="tree-status-header">
+                  <span className="tree-status-label">AST Tree Status:</span>
+                  <button
+                    className="sync-tree-button"
+                    onClick={syncTree}
+                    title="Force sync AST tree"
+                  >
+                    🔄 Sync Tree
+                  </button>
+                </div>
+                <div className="tree-status-details">
+                  <span
+                    className={`status-indicator ${
+                      treeStatus.isDirty ? "dirty" : "clean"
+                    }`}
+                  >
+                    {treeStatus.isDirty ? "🔄 Dirty" : "✅ Clean"}
+                  </span>
+                  <span className="pending-edits">
+                    {treeStatus.pendingEditsCount} pending edits
+                  </span>
+                  <span className="last-parse">
+                    Last parsed:{" "}
+                    {new Date(treeStatus.lastParseTime).toLocaleTimeString()}
                   </span>
                 </div>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {errors.length > 0 && (

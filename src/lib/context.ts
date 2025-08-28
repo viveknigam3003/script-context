@@ -38,6 +38,7 @@ export class ContextExtractor {
 
   private tree: Tree | null = null;
   private dirty = true;
+  private lastParseTime: number = 0;
 
   /**
    * We store pending incremental edits between parses.
@@ -76,8 +77,28 @@ export class ContextExtractor {
     // Initial parse
     instance.tree = instance.parser.parse(model.getValue());
     instance.dirty = false;
+    instance.lastParseTime = Date.now();
 
     return instance;
+  }
+
+  /**
+   * Get the current status of the AST tree
+   */
+  getTreeStatus() {
+    return {
+      isDirty: this.dirty,
+      hasTree: !!this.tree,
+      pendingEditsCount: this.pendingEdits.length,
+      lastParseTime: this.lastParseTime,
+    };
+  }
+
+  /**
+   * Force rebuild the AST tree immediately
+   */
+  forceBuildTree() {
+    this.ensureIncrementalParseUpToDate();
   }
 
   /**
@@ -228,6 +249,7 @@ export class ContextExtractor {
       this.tree = this.parser.parse(this.model.getValue());
       this.pendingEdits = [];
       this.dirty = false;
+      this.lastParseTime = Date.now();
       return;
     }
 
@@ -240,39 +262,8 @@ export class ContextExtractor {
     this.tree = this.parser.parse(this.model.getValue(), this.tree);
     this.pendingEdits = [];
     this.dirty = false;
+    this.lastParseTime = Date.now();
   }
-
-  //   /** Find the nearest enclosing function-like node */
-  //   private findEnclosingFunctionLike(node: Node): Node | null {
-  //     // TODO: Check if this supports capturing pm.* style syntax like pm.test, pm.sendRequest etc...
-  //     const functionTypes = new Set<string>([
-  //       "function_declaration",
-  //       "function",
-  //       "function_expression",
-  //       "arrow_function",
-  //       "method_definition",
-  //       "generator_function",
-  //       "class_method",
-  //       // Helpful for JS: functions passed to calls like pm.test(..., function() { ... })
-  //       // We treat the containing function body as function-like if we are inside.
-  //     ]);
-
-  //     let cur: Node | null = node;
-  //     while (cur) {
-  //       if (functionTypes.has(cur.type)) return cur;
-
-  //       // Heuristic: if we're inside an argument list and one of the arguments is a function,
-  //       // jump up to that function node.
-  //       if (cur.type === "arguments") {
-  //         const fnArg = cur.namedChildren.find(
-  //           (c) => c && functionTypes.has(c.type)
-  //         );
-  //         if (fnArg) return fnArg;
-  //       }
-  //       cur = cur.parent;
-  //     }
-  //     return null;
-  //   }
 
   /** Find the nearest enclosing function-like node */
   private findEnclosingFunctionLike(node: Node): Node | null {
