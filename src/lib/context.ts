@@ -11,6 +11,12 @@ export interface ContextOptions {
    * Defaults to 5.
    */
   fallbackLineWindow?: number;
+  /**
+   * Level of context extraction for a given code block.
+   * 0 => innermost function only (current behavior),
+   * 1 => parent function, 2 => grandparent, etc.
+   */
+  nestingLevel?: number; // default 0
 }
 
 export interface ExtractContextResult {
@@ -191,10 +197,17 @@ export class ContextExtractor {
     }
 
     // 1) Try enclosing function-like block
-    const funcNode = this.findEnclosingFunctionLike(nodeAtCursor);
-    if (funcNode) {
-      // CHANGED: If function is used as an argument, include its wrapping call.
-      const container = this.wrapFunctionIfArgument(funcNode);
+    const innerFunc = this.nearestFunctionFrom(nodeAtCursor);
+    if (innerFunc) {
+      const targetFunc = this.elevateFunctionByLevels(
+        innerFunc,
+        opts.nestingLevel || Infinity // Infinity to reach till global boundary
+      );
+
+      // Keep the behavior: if the selected function is used as an argument,
+      // wrap to the call/new expression so we don’t miss the closing parens.
+      const container = this.wrapFunctionIfArgument(targetFunc);
+
       const { startOffset, endOffset } = this.expandNodeToFullLines(container);
       return {
         text: this.model.getValueInRange({
@@ -265,10 +278,8 @@ export class ContextExtractor {
     this.lastParseTime = Date.now();
   }
 
-  /** Find the nearest enclosing function-like node */
-  private findEnclosingFunctionLike(node: Node): Node | null {
-    // CHANGED: centralized helpers for robust detection
-    const isFunctionLike = (n: Node | null) =>
+  private isFunctionLike(n: Node | null): boolean {
+    return (
       !!n &&
       (n.type === "function_declaration" ||
         n.type === "function_expression" ||
@@ -276,23 +287,85 @@ export class ContextExtractor {
         n.type === "method_definition" ||
         n.type === "generator_function" ||
         n.type === "class_method" ||
-        n.type === "function");
+        n.type === "function")
+    );
+  }
 
-    const isFunctionBody = (n: Node | null) =>
-      !!n && (n.type === "statement_block" || n.type === "function_body");
+  private isFunctionBody(n: Node | null): boolean {
+    return !!n && (n.type === "statement_block" || n.type === "function_body");
+  }
 
+  private nearestFunctionFrom(node: Node): Node | null {
     let cur: Node | null = node;
     while (cur) {
-      if (isFunctionLike(cur)) return cur;
+      if (this.isFunctionLike(cur)) return cur;
+      if (
+        this.isFunctionBody(cur) &&
+        cur.parent &&
+        this.isFunctionLike(cur.parent)
+      ) {
+        return cur.parent;
+      }
+      if (cur.type === "arguments") {
+        const fnArg = cur.namedChildren.find((c) => this.isFunctionLike(c));
+        if (fnArg) return fnArg;
+      }
+      cur = cur.parent;
+    }
+    return null;
+  }
+
+  private elevateFunctionByLevels(funcNode: Node, levels: number): Node {
+    if (levels <= 0) return funcNode;
+    let current: Node = funcNode;
+
+    for (let i = 0; i < levels; i++) {
+      // Walk up until we find the *next* outer function-like ancestor
+      let p: Node | null = current.parent;
+      let promoted: Node | null = null;
+
+      while (p) {
+        if (this.isFunctionLike(p)) {
+          promoted = p;
+          break;
+        }
+        // Also handle being inside a function body on the path upwards
+        if (
+          this.isFunctionBody(p) &&
+          p.parent &&
+          this.isFunctionLike(p.parent)
+        ) {
+          promoted = p.parent;
+          break;
+        }
+        p = p.parent;
+      }
+
+      if (!promoted) break; // no more enclosing functions — stop early
+      current = promoted;
+    }
+
+    return current;
+  }
+
+  /** Find the nearest enclosing function-like node */
+  private findEnclosingFunctionLike(node: Node): Node | null {
+    let cur: Node | null = node;
+    while (cur) {
+      if (this.isFunctionLike(cur)) return cur;
 
       // CHANGED: hop from body -> its function
-      if (isFunctionBody(cur) && cur.parent && isFunctionLike(cur.parent)) {
+      if (
+        this.isFunctionBody(cur) &&
+        cur.parent &&
+        this.isFunctionLike(cur.parent)
+      ) {
         return cur.parent;
       }
 
       // If inside a call's arguments, prefer a function argument
       if (cur.type === "arguments") {
-        const fnArg = cur.namedChildren.find(isFunctionLike);
+        const fnArg = cur.namedChildren.find(this.isFunctionLike);
         if (fnArg) return fnArg;
       }
 
