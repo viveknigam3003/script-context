@@ -1,0 +1,269 @@
+.app {
+  min-height: 100vh;
+  background: #1e1e1e;
+  color: #ffffff;
+}
+
+.app-header {
+  padding: 2rem;
+  text-align: center;
+  border-bottom: 1px solid #333;
+  background: #252526;
+}
+
+.app-header h1 {
+  margin: 0 0 0.5rem 0;
+  font-size: 2.5rem;
+  color: #007acc;
+  font-weight: 600;
+}
+
+.app-header p {
+  margin: 0;
+  color: #cccccc;
+  font-size: 1.1rem;
+}
+
+.app-main {
+  padding: 2rem;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.editor-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  margin-bottom: 2rem;
+}
+
+.editor-section h2 {
+  margin: 0 0 1rem 0;
+  color: #ffffff;
+  font-size: 1.3rem;
+  font-weight: 500;
+}
+
+.editor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+
+.cursor-display {
+  display: flex;
+  align-items: center;
+}
+
+.cursor-info {
+  background: #3c3c3c;
+  color: #cccccc;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.9rem;
+  border: 1px solid #555;
+}
+
+.cursor-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.cursor-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #cccccc;
+  font-size: 0.9rem;
+}
+
+.cursor-input {
+  width: 60px;
+  padding: 0.25rem 0.5rem;
+  background: #3c3c3c;
+  border: 1px solid #555;
+  border-radius: 4px;
+  color: #ffffff;
+  font-size: 0.9rem;
+}
+
+.cursor-input:focus {
+  outline: none;
+  border-color: #007acc;
+}
+
+.extract-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 2rem;
+  background: #252526;
+  border-radius: 8px;
+  margin-bottom: 2rem;
+}
+
+.extract-button {
+  background: linear-gradient(135deg, #007acc, #005a9e);
+  color: white;
+  border: none;
+  padding: 0.75rem 2rem;
+  border-radius: 8px;
+  font-size: 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 12px rgba(0, 122, 204, 0.3);
+}
+
+.extract-button:hover:not(:disabled) {
+  background: linear-gradient(135deg, #0086e6, #006bb3);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0, 122, 204, 0.4);
+}
+
+.extract-button:disabled {
+  background: #555;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.success-message {
+  background: #1e4f3a;
+  color: #7bc96f;
+  padding: 1rem 1.5rem;
+  border-radius: 6px;
+  border-left: 4px solid #7bc96f;
+  font-weight: 500;
+  font-size: 1rem;
+}
+
+.stats-section {
+  background: #2d2d30;
+  border: 1px solid #3e3e42;
+  border-radius: 8px;
+  padding: 1.5rem;
+  width: 100%;
+  max-width: 600px;
+}
+
+.stats-section h3 {
+  margin: 0 0 1rem 0;
+  color: #ffffff;
+  font-size: 1.2rem;
+  font-weight: 500;
+  text-align: center;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 1rem;
+  background: #383838;
+  border-radius: 6px;
+  border: 1px solid #4a4a4a;
+}
+
+.stat-label {
+  color: #cccccc;
+  font-size: 0.9rem;
+  margin-bottom: 0.5rem;
+  text-align: center;
+}
+
+.stat-value {
+  color: #007acc;
+  font-size: 1.3rem;
+  font-weight: 600;
+}
+
+.editor-wrapper {
+  border: 1px solid #333;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.errors-section {
+  background: #2d1b1b;
+  border: 1px solid #5a2d2d;
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-top: 2rem;
+}
+
+.errors-section h3 {
+  margin: 0 0 1rem 0;
+  color: #ff6b6b;
+  font-size: 1.2rem;
+  font-weight: 500;
+}
+
+.errors-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.error-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  background: #3d2626;
+  border-radius: 6px;
+  border-left: 4px solid #ff6b6b;
+}
+
+.error-icon {
+  font-size: 1.1rem;
+  flex-shrink: 0;
+}
+
+.error-message {
+  color: #ffcccc;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+/* Responsive design */
+@media (max-width: 1024px) {
+  .editor-container {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+  
+  .app-main {
+    padding: 1rem;
+  }
+  
+  .app-header {
+    padding: 1.5rem;
+  }
+  
+  .app-header h1 {
+    font-size: 2rem;
+  }
+}
+
+@media (max-width: 768px) {
+  .app-header h1 {
+    font-size: 1.8rem;
+  }
+  
+  .editor-wrapper {
+    height: 300px;
+  }
+}
