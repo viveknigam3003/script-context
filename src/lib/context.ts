@@ -18,6 +18,10 @@ export interface ContextOptions {
    * Max level = 50;
    */
   nestingLevel?: number; // default 0
+  /** Hard budget for fallback & sibling strategies (approx chars).
+   * Default ~4k chars (~1k tokens).
+   */
+  maxCharsBudget?: number; // NEW (optional)
 }
 
 export interface ExtractContextResult {
@@ -256,9 +260,11 @@ export class ContextExtractor {
 
       // CHANGED: include the current top-level node too
       const blocks: Array<{ startOffset: number; endOffset: number }> = [];
-      blocks.push(this.expandNodeToFullLines(topLevel));
-      if (prev) blocks.push(this.expandNodeToFullLines(prev));
-      if (next) blocks.push(this.expandNodeToFullLines(next));
+      blocks.push(this.expandNodeToFullLinesWithLeadingComments(topLevel)); // 👈
+      if (prev)
+        blocks.push(this.expandNodeToFullLinesWithLeadingComments(prev)); // 👈
+      if (next)
+        blocks.push(this.expandNodeToFullLinesWithLeadingComments(next)); // 👈
 
       if (blocks.length > 0) {
         const merged = this.mergeRanges(blocks);
@@ -280,7 +286,11 @@ export class ContextExtractor {
     }
 
     // 3) Else fallback lines around cursor
-    return this.linesAround(cursor, opts.fallbackLineWindow ?? 5);
+    return this.linesAround(
+      cursor,
+      opts.fallbackLineWindow ?? 5,
+      opts.maxCharsBudget
+    );
   }
 
   /** Apply pending edits and reparse incrementally if needed */
@@ -318,6 +328,99 @@ export class ContextExtractor {
         n.type === "class_method" ||
         n.type === "function")
     );
+  }
+
+  private isWholeBlockCandidate(n: Node): boolean {
+    // Keep this focused on JS + your Postman scripts
+    return (
+      n.type === "function_declaration" ||
+      n.type === "function_expression" ||
+      n.type === "arrow_function" ||
+      n.type === "method_definition" ||
+      n.type === "generator_function" ||
+      n.type === "class_declaration" ||
+      n.type === "lexical_declaration" || // 👈 ADD THIS (const/let)
+      n.type === "variable_declaration" || // var
+      n.type === "expression_statement" || // e.g. pm.test(...)
+      n.type === "if_statement" ||
+      n.type === "for_statement" ||
+      n.type === "for_in_statement" ||
+      n.type === "for_of_statement" ||
+      n.type === "while_statement" ||
+      n.type === "do_statement" ||
+      n.type === "try_statement" ||
+      n.type === "switch_statement"
+    );
+  }
+
+  /** Expand a top-level or statement node to its “container” we want to keep whole. */
+  private wholeBlockContainer(n: Node): Node {
+    // If it's a function used as an argument, prefer the enclosing call/new so we keep closing ')'
+    if (this.isFunctionLike(n)) return this.wrapFunctionIfArgument(n);
+    // If the statement is an expression_statement whose expression is a call (e.g., pm.test(...))
+    if (n.type === "expression_statement" && n.namedChildren.length === 1) {
+      const child = n.namedChildren[0];
+      if (
+        child &&
+        (child.type === "call_expression" || child.type === "new_expression")
+      ) {
+        return child;
+      }
+    }
+    return n;
+  }
+
+  /** Return whole-block ranges that intersect a line window, but only as full nodes (no slicing). */
+  private collectWholeBlocksIntersectingWindow(
+    startLine: number,
+    endLine: number
+  ): Array<{ startOffset: number; endOffset: number; node: Node }> {
+    if (!this.tree) return [];
+    const root = this.tree.rootNode;
+
+    // Gather direct children (top-level statements) that intersect the window
+    const results: Array<{
+      startOffset: number;
+      endOffset: number;
+      node: Node;
+    }> = [];
+
+    for (let i = 0; i < root.namedChildCount; i++) {
+      const child = root.namedChild(i)!;
+      if (!this.isWholeBlockCandidate(child)) continue;
+
+      const s = child.startPosition.row + 1;
+      const e = child.endPosition.row + 1;
+
+      // Intersect line window?
+      if (e < startLine || s > endLine) continue;
+
+      const container = this.wholeBlockContainer(child);
+      const { startOffset, endOffset } =
+        this.expandNodeToFullLinesWithLeadingComments(container); // 👈
+      results.push({ startOffset, endOffset, node: container });
+    }
+
+    return results.sort((a, b) => a.startOffset - b.startOffset);
+  }
+
+  /** Pack whole blocks into a char budget (never cut). Keeps order, merges adjacency. */
+  private packBlocksWithinBudget(
+    blocks: Array<{ startOffset: number; endOffset: number }>,
+    maxChars: number
+  ): Array<{ startOffset: number; endOffset: number }> {
+    const merged = this.mergeRanges(blocks); // you already have mergeRanges
+    const packed: Array<{ startOffset: number; endOffset: number }> = [];
+    let used = 0;
+
+    for (const r of merged) {
+      const size = r.endOffset - r.startOffset;
+      if (size <= 0) continue;
+      if (used + size > maxChars) break; // stop before over-budget
+      packed.push(r);
+      used += size;
+    }
+    return packed;
   }
 
   private isFunctionBody(n: Node | null): boolean {
@@ -402,6 +505,28 @@ export class ContextExtractor {
     return next ?? null;
   }
 
+  private expandNodeToFullLinesWithLeadingComments(node: Node): {
+    startOffset: number;
+    endOffset: number;
+  } {
+    // Walk non-named siblings backward to include contiguous comments
+    let startNode: Node = node;
+    let p: Node | null = node.previousSibling;
+    while (p && p.type === "comment") {
+      // Only include comments that are directly adjacent (no blank line between)
+      const commentEndLine = p.endPosition.row;
+      const nodeStartLine = startNode.startPosition.row;
+      if (commentEndLine + 1 === nodeStartLine) {
+        startNode = p;
+        p = p.previousSibling;
+      } else {
+        break;
+      }
+    }
+    // Then do your normal full-line expansion
+    return this.expandNodeToFullLines(startNode);
+  }
+
   /** Expand a node to full-line boundaries (never cut lines) */
   private expandNodeToFullLines(node: Node): {
     startOffset: number;
@@ -424,27 +549,108 @@ export class ContextExtractor {
   }
 
   /** Fallback: N lines above and below cursor, clamped to file bounds */
-  private linesAround(cursor: Position, window: number): ExtractContextResult {
+  /** Fallback: prefer whole blocks intersecting a small window; never cut. */
+  private linesAround(
+    cursor: Position,
+    window: number,
+    maxCharsBudget?: number
+  ): ExtractContextResult {
     const totalLines = this.model.getLineCount();
     const startLine = Math.max(1, cursor.lineNumber - window);
     const endLine = Math.min(totalLines, cursor.lineNumber + window);
 
+    // 1) Collect whole blocks that intersect the line window
+    const blocks = this.collectWholeBlocksIntersectingWindow(
+      startLine,
+      endLine
+    );
+
+    // 2) If we found blocks, include them as whole nodes within budget
+    const budget = Math.max(0, maxCharsBudget ?? 4000); // ~1k tokens by default
+    if (blocks.length > 0) {
+      const packed = this.packBlocksWithinBudget(
+        blocks.map((b) => ({
+          startOffset: b.startOffset,
+          endOffset: b.endOffset,
+        })),
+        budget
+      );
+      if (packed.length > 0) {
+        const merged = this.mergeRanges(packed);
+        const startOffset = merged[0].startOffset;
+        const endOffset = merged[merged.length - 1].endOffset;
+
+        const text = this.model.getValueInRange({
+          startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
+          startColumn: 1,
+          endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
+          endColumn: this.lineEndColumnAtOffset(endOffset),
+        });
+
+        return { text, startOffset, endOffset, strategy: "fallback-lines" };
+      }
+    }
+
+    // 3) If no whole block fits, return the *nearest* single statement (whole) if any
+    //    This avoids returning syntactically broken snippets.
+    const nodeAtCursor = this.tree!.rootNode.descendantForPosition({
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    });
+    if (nodeAtCursor) {
+      // Try the nearest function; if none, nearest top-level statement
+      const f = this.nearestFunctionFrom(nodeAtCursor);
+      if (f) {
+        const container = this.wrapFunctionIfArgument(f);
+        const { startOffset, endOffset } =
+          this.expandNodeToFullLines(container);
+        const size = endOffset - startOffset;
+        if (size <= budget) {
+          const text = this.model.getValueInRange({
+            startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
+            startColumn: 1,
+            endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
+            endColumn: this.lineEndColumnAtOffset(endOffset),
+          });
+          return { text, startOffset, endOffset, strategy: "fallback-lines" };
+        }
+      }
+
+      // Fall back to the cursor's top-level ancestor as a whole statement if it fits
+      const top = this.topLevelAncestor(nodeAtCursor);
+      if (top) {
+        const { startOffset, endOffset } = this.expandNodeToFullLines(
+          this.wholeBlockContainer(top)
+        );
+        const size = endOffset - startOffset;
+        if (size <= budget) {
+          const text = this.model.getValueInRange({
+            startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
+            startColumn: 1,
+            endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
+            endColumn: this.lineEndColumnAtOffset(endOffset),
+          });
+          return { text, startOffset, endOffset, strategy: "fallback-lines" };
+        }
+      }
+    }
+
+    // 4) As absolute last resort, return *just the current full line* (never mid-line).
+    //    This keeps syntax valid (at least a complete line), even if not very useful.
     const startOffset = this.model.getOffsetAt({
-      lineNumber: startLine,
+      lineNumber: cursor.lineNumber,
       column: 1,
     });
     const endOffset = this.model.getOffsetAt({
-      lineNumber: endLine,
-      column: this.lineEndColumn(endLine),
+      lineNumber: cursor.lineNumber,
+      column: this.lineEndColumn(cursor.lineNumber),
     });
-
     const text = this.model.getValueInRange({
-      startLineNumber: startLine,
+      startLineNumber: cursor.lineNumber,
       startColumn: 1,
-      endLineNumber: endLine,
-      endColumn: this.lineEndColumn(endLine),
+      endLineNumber: cursor.lineNumber,
+      endColumn: this.lineEndColumn(cursor.lineNumber),
     });
-
     return { text, startOffset, endOffset, strategy: "fallback-lines" };
   }
 
