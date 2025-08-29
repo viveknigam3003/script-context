@@ -1,6 +1,10 @@
 import { useState, useCallback, useEffect, useRef } from "react";
+import { IconCodeDots } from "@tabler/icons-react";
 import { monaco } from "./lib/monacoSetup";
-import { ContextExtractor } from "./lib/context";
+import {
+  ContextExtractor,
+  type ExtractRankedContextSections,
+} from "./lib/context";
 import "./App.css";
 
 function App() {
@@ -62,6 +66,23 @@ function App() {
       updateTreeStatus();
     }
   }, [updateTreeStatus]);
+
+  // Beautify code function
+  const beautifyCode = useCallback(() => {
+    if (!inputEditorInstance.current) return;
+
+    const model = inputEditorInstance.current.getModel();
+    if (!model) return;
+
+    try {
+      // Use Monaco's built-in formatting action
+      inputEditorInstance.current
+        .getAction("editor.action.formatDocument")
+        ?.run();
+    } catch (error) {
+      console.warn("Failed to format code:", error);
+    }
+  }, []);
 
   // Initialize Monaco editors
   useEffect(() => {
@@ -161,6 +182,47 @@ function App() {
     };
   }, [updateTreeStatus, debouncedRebuildTree]);
 
+  const combineSectionsForPreview = (
+    s: ExtractRankedContextSections
+  ): string => {
+    return [
+      s.linesAroundCursor,
+      s.declarations,
+      s.relevantLines,
+      s.existingTests,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+  };
+
+  const printDebugLogs = (sections: ExtractRankedContextSections) => {
+    // Inspect tuning signals
+    console.log("=== Context Sections ===");
+    console.log("Lines Around Cursor:\n\n", sections.linesAroundCursor);
+    console.log("Declarations:\n\n", sections.declarations);
+    console.log("Relevant Lines:\n\n", sections.relevantLines);
+    console.log("Existing Tests:\n\n", sections.existingTests);
+    console.log("=== Context Extraction Debug Info ===");
+    console.log(sections.meta);
+    console.table(
+      sections.debug?.picked.B.map((x) => ({
+        score: x.score.toFixed(3),
+        kind: x.kind,
+        size: x.sizeChars,
+        lex: x.signals.lexical.toFixed(2),
+        ref: x.signals.reference.toFixed(2),
+        title: (
+          x.score -
+          (0.3 * x.signals.lexical +
+            0.35 * x.signals.reference +
+            0.2 * x.signals.kind -
+            0.05 * x.signals.complexity)
+        ).toFixed(2), // W_TITLE contrib
+      }))
+    );
+    console.table(sections.debug?.depsAdded);
+  };
+
   // Function for processing code using the context extractor
   const extractScript = useCallback(async () => {
     setIsExtracting(true);
@@ -209,25 +271,30 @@ function App() {
       // });
 
       // Ranked Results
-      const result = contextExtractor.current.getRankedContext(position, {
-        maxCharsBudget: 100,
-        fallbackLineWindow: 6,
-        nestingLevel: 10, // climb to pm.test wrapper when inside callbacks
-        includeLeadingComments: true,
-        tierPercents: { A: 0.4, B: 0.3, C: 0.2, D: 0.1 },
-      });
+      const sections = contextExtractor.current.getRankedContextSections(
+        position,
+        {
+          maxCharsBudget: 100,
+          fallbackLineWindow: 6,
+          nestingLevel: 10, // climb to pm.test wrapper when inside callbacks
+          includeLeadingComments: true,
+          tierPercents: { A: 0.4, B: 0.3, C: 0.2, D: 0.1 },
+        }
+      );
+
+      printDebugLogs(sections);
 
       // Display the extracted context
       setExtractionStats({
-        strategy: result.strategy,
-        totalChars: result.text.length,
+        strategy: sections.meta.strategy,
+        totalChars: sections.meta.budgets.total,
       });
 
       // Update output editor
       if (outputEditorInstance.current) {
         const outputModel = outputEditorInstance.current.getModel();
         if (outputModel) {
-          outputModel.setValue(result.text);
+          outputModel.setValue(combineSectionsForPreview(sections));
         }
       }
 
@@ -271,6 +338,13 @@ function App() {
                 <span className="cursor-info">
                   Cursor: Line {cursor.lineNumber}, Column {cursor.column}
                 </span>
+                <button
+                  className="beautify-button"
+                  onClick={beautifyCode}
+                  title="Beautify/Format Code"
+                >
+                  <IconCodeDots size={16} />
+                </button>
               </div>
             </div>
             <div className="editor-wrapper">

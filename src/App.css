@@ -53,6 +53,7 @@
 .cursor-display {
   display: flex;
   align-items: center;
+  gap: 0.5rem;
 }
 
 .cursor-info {
@@ -63,6 +64,26 @@
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
   font-size: 12px;
   border: 1px solid #555;
+}
+
+.beautify-button {
+  background: #3c3c3c;
+  color: #cccccc;
+  border: 1px solid #555;
+  padding: 0.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.beautify-button:hover {
+  background: #4a4a4a;
+  color: #ffffff;
+  border-color: #666;
+  transform: translateY(-1px);
 }
 
 .extract-section {

@@ -26,6 +26,67 @@ export interface ContextOptions {
   includeLeadingComments?: boolean; // default true (you already do it)
 }
 
+export interface RankedSectionsOptions extends ContextOptions {
+  /** Emit rich debug info about ranking/selection. */
+  debug?: boolean;
+}
+
+export type DebugInfo = {
+  titleTokens: string[];
+  budgets: { A: number; B: number; C: number; D: number; total: number };
+  scored: {
+    B: RankedBlock[];
+    C: RankedBlock[];
+  };
+  picked: {
+    B: RankedBlock[];
+    C: RankedBlock[];
+  };
+  skipped: {
+    B: Array<{
+      block: RankedBlock;
+      reason: "over_budget" | "overlap_A" | "tie_break";
+    }>;
+    C: Array<{
+      block: RankedBlock;
+      reason: "over_budget" | "overlap_A" | "tie_break";
+    }>;
+  };
+  depsAdded: Array<{ name: string; startOffset: number; endOffset: number }>;
+};
+
+export interface ExtractRankedContextSections {
+  /** Tier A */
+  linesAroundCursor: string; // the local/test block (Tier A)
+  /** Tier B (+ dependency one-hop) */
+  declarations: string; // selected globals/const/let/var & pulled deps
+  /** Tier C (title-matched helpers or small glue picked as "most relevant") */
+  relevantLines: string; // small non-global helpers that made the cut (optional)
+  /** Other existing tests chosen for context or compact skeletons for skipped ones */
+  existingTests: string; // other pm.test(...) blocks or skeletons
+  /** Metadata + offsets to highlight */
+  meta: {
+    strategy: ExtractContextResult["strategy"];
+    budgets: { A: number; B: number; C: number; D: number; total: number };
+    offsets: {
+      A: Array<{ startOffset: number; endOffset: number }>;
+      B: Array<{ startOffset: number; endOffset: number }>;
+      C: Array<{ startOffset: number; endOffset: number }>;
+      D: Array<{ startOffset: number; endOffset: number }>;
+    };
+    pickedCounts: {
+      A: number;
+      B: number;
+      C: number;
+      D: number;
+      skeletons: number;
+    };
+    titleTokens: string[];
+  };
+  /** Optional debug payload with rankings, signals, and reasons. */
+  debug?: DebugInfo;
+}
+
 const W_TITLE = 0.2; // boosts title/name overlap
 
 export interface ExtractContextResult {
@@ -145,6 +206,12 @@ export class ContextExtractor {
    */
   forceBuildTree() {
     this.ensureIncrementalParseUpToDate();
+  }
+
+  private _lastDebug: DebugInfo | null = null;
+
+  public getLastDebug(): DebugInfo | null {
+    return this._lastDebug;
   }
 
   /**
@@ -1146,7 +1213,7 @@ export class ContextExtractor {
       arg0 && (arg0.type === "string" || arg0.type === "template_string")
         ? arg0.text
         : '"test"';
-    return `/* <|existing_tests|> pm.test(${lit}, function () { ... }); */`;
+    return `pm.test(${lit}, function () { ... });`;
   }
 
   private deriveBudgets(
@@ -1159,6 +1226,24 @@ export class ContextExtractor {
     const C = clamp(totalChars * perc.C);
     const D = clamp(totalChars * perc.D);
     return { A, B, C, D, total: A + B + C + D };
+  }
+
+  private textFromRanges(
+    ranges: Array<{ startOffset: number; endOffset: number }>
+  ): string {
+    const parts: string[] = [];
+    for (const r of ranges) {
+      if (r.endOffset <= r.startOffset) continue;
+      parts.push(
+        this.model.getValueInRange({
+          startLineNumber: this.model.getPositionAt(r.startOffset).lineNumber,
+          startColumn: 1,
+          endLineNumber: this.model.getPositionAt(r.endOffset).lineNumber,
+          endColumn: this.lineEndColumnAtOffset(r.endOffset),
+        })
+      );
+    }
+    return parts.join("\n");
   }
 
   private buildFinalTextFromRanges(
@@ -1193,15 +1278,23 @@ export class ContextExtractor {
    * - Keeps your existing strategies for Tier A.
    * - Adds Globals (B) and Test skeletons/blocks (C), then Behavioral (D, TODO hook).
    */
-  public getRankedContext(
+  public getRankedContextSections(
     cursor: Position,
-    opts: ContextOptions = {}
-  ): ExtractContextResult {
+    opts: RankedSectionsOptions = {}
+  ): ExtractRankedContextSections {
     const totalBudget = Math.max(1000, opts.maxCharsBudget ?? 8000);
-    const percents = opts.tierPercents ?? { A: 0.4, B: 0.3, C: 0.2, D: 0.1 };
+    const percents = opts.tierPercents ?? DEFAULT_TIER_PERCENTS;
     const budgets = this.deriveBudgets(totalBudget, percents);
+    const debug: DebugInfo = {
+      titleTokens: [],
+      budgets: { ...budgets, total: totalBudget },
+      scored: { B: [], C: [] },
+      picked: { B: [], C: [] },
+      skipped: { B: [], C: [] },
+      depsAdded: [],
+    };
 
-    // Tier A (unchanged)
+    // ---- Tier A (local/test near cursor) ----
     const tierA = this.getContextAroundCursor(cursor, {
       ...opts,
       maxCharsBudget: budgets.A,
@@ -1210,8 +1303,9 @@ export class ContextExtractor {
       startOffset: tierA.startOffset,
       endOffset: tierA.endOffset,
     };
+    const linesAroundCursorRanges = [baseRange];
 
-    // If Tier A is pm.test, capture title tokens
+    // Title tokens for A if it's a pm.test(...)
     const nodeAtCursor = this.tree!.rootNode.descendantForPosition({
       row: cursor.lineNumber - 1,
       column: cursor.column - 1,
@@ -1220,8 +1314,9 @@ export class ContextExtractor {
     const aContainer = aFunc ? this.wrapFunctionIfArgument(aFunc) : null;
     const title = aContainer ? this.getTestTitleFromNode(aContainer) : null;
     const titleTokens = this.tokenize(title);
+    debug.titleTokens = titleTokens;
 
-    // Build global index (for dependency expansion)
+    // ---- Build global index for dependency expansion
     const globalIndex = this.buildGlobalIndex();
 
     // ---- Tier B: Globals (exclude overlap with A)
@@ -1235,11 +1330,22 @@ export class ContextExtractor {
       { ...baseRange, text: tierA.text },
       cursor,
       budgets.B,
-      /* pass */ titleTokens
+      titleTokens
     );
-    const pickedB = this.selectWithinBudget(rankedB, budgets.B);
+    debug.scored.B = rankedB;
 
-    // ---- Tier C: Other tests
+    const pickedB = this.selectWithinBudget(rankedB, budgets.B);
+    debug.picked.B = pickedB;
+    // mark skips (budget based; overlap with A was pre-filtered)
+    const pickedBSet = new Set(pickedB);
+    for (const r of rankedB) {
+      if (!pickedBSet.has(r)) {
+        const reason: "over_budget" | "overlap_A" | "tie_break" = "over_budget";
+        debug.skipped.B.push({ block: r, reason });
+      }
+    }
+
+    // ---- Tier C: Other tests (exclude A)
     const others = this.collectOtherTestBlocks(baseRange);
     const rankedC = this.scoreCandidates(
       others,
@@ -1248,9 +1354,17 @@ export class ContextExtractor {
       budgets.C,
       titleTokens
     );
-    const pickedC = this.selectWithinBudget(rankedC, budgets.C);
+    debug.scored.C = rankedC;
 
-    // ---- Dependency closure (one hop) using leftover in B+C budgets
+    const pickedC = this.selectWithinBudget(rankedC, budgets.C);
+    debug.picked.C = pickedC;
+    const pickedCSet = new Set(pickedC);
+    for (const r of rankedC) {
+      if (!pickedCSet.has(r))
+        debug.skipped.C.push({ block: r, reason: "over_budget" });
+    }
+
+    // ---- One-hop dependency closure for (B + C)
     const rangesBC = [
       ...pickedB.map((b) => ({
         startOffset: b.startOffset,
@@ -1274,13 +1388,87 @@ export class ContextExtractor {
       bcBudgetLeft
     );
 
-    // ---- Final multi-chunk build (no widening!)
-    const allRanges = [baseRange, ...depExpanded];
-    const { text, startOffset, endOffset } = this.buildFinalTextFromRanges(
-      allRanges,
-      totalBudget
+    // Record which deps were added (best-effort by matching to globalIndex blocks)
+    const depKeys = new Set(
+      depExpanded.map((r) => `${r.startOffset}:${r.endOffset}`)
     );
+    for (const [name, br] of globalIndex.entries()) {
+      const key = `${br.startOffset}:${br.endOffset}`;
+      if (
+        depKeys.has(key) &&
+        !rangesBC.some(
+          (r) =>
+            r.startOffset === br.startOffset && r.endOffset === br.endOffset
+        )
+      ) {
+        debug.depsAdded.push({
+          name,
+          startOffset: br.startOffset,
+          endOffset: br.endOffset,
+        });
+      }
+    }
 
-    return { text, startOffset, endOffset, strategy: tierA.strategy };
+    // ---- Partition into sections (strings; non-merged, budget-respecting)
+    // A: linesAroundCursor
+    const linesAroundCursor = this.textFromRanges(linesAroundCursorRanges);
+
+    // B: declarations (picked globals + dependency additions that are globals)
+    const declRanges = depExpanded.filter((r) =>
+      globals.some(
+        (g) => g.startOffset === r.startOffset && g.endOffset === r.endOffset
+      )
+    );
+    const declarations = this.textFromRanges(declRanges);
+
+    // C: relevantLines (non-global small helpers that slipped in; in this version, we keep empty)
+    const relevantRanges: Array<{ startOffset: number; endOffset: number }> =
+      [];
+    const relevantLines = this.textFromRanges(relevantRanges);
+
+    // D: existingTests (pickedC as full blocks OR skeletons if nothing fit)
+    let existingTests = "";
+    if (pickedC.length) {
+      existingTests = this.textFromRanges(pickedC);
+    } else {
+      // skeletons for top-2 skipped
+      const skeletons = rankedC
+        .slice(0, 2)
+        .map((r) => this.renderTestSkeleton(r.node));
+      existingTests = skeletons.join("\n");
+    }
+
+    // ---- Meta & debug
+    const res: ExtractRankedContextSections = {
+      linesAroundCursor,
+      declarations,
+      relevantLines,
+      existingTests,
+      meta: {
+        strategy: tierA.strategy,
+        budgets,
+        offsets: {
+          A: linesAroundCursorRanges,
+          B: declRanges,
+          C: relevantRanges,
+          D: pickedC.map((b) => ({
+            startOffset: b.startOffset,
+            endOffset: b.endOffset,
+          })),
+        },
+        pickedCounts: {
+          A: 1,
+          B: declRanges.length,
+          C: relevantRanges.length,
+          D: pickedC.length,
+          skeletons: pickedC.length ? 0 : Math.min(2, rankedC.length),
+        },
+        titleTokens,
+      },
+      debug: opts.debug ? debug : undefined,
+    };
+
+    this._lastDebug = opts.debug ? debug : null;
+    return res;
   }
 }
