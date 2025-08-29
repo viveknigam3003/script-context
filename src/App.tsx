@@ -203,9 +203,18 @@ function App() {
       }
 
       // Extract context using the context extractor
-      const result = contextExtractor.current.getContextAroundCursor(position, {
+      // const result = contextExtractor.current.getContextAroundCursor(position, {
+      //   fallbackLineWindow: 6,
+      //   nestingLevel: 10,
+      // });
+
+      // Ranked Results
+      const result = contextExtractor.current.getRankedContext(position, {
+        maxCharsBudget: 100,
         fallbackLineWindow: 6,
-        nestingLevel: 10,
+        nestingLevel: 10, // climb to pm.test wrapper when inside callbacks
+        includeLeadingComments: true,
+        tierPercents: { A: 0.4, B: 0.3, C: 0.2, D: 0.1 },
       });
 
       // Display the extracted context
