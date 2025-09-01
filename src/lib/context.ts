@@ -1246,33 +1246,6 @@ export class ContextExtractor {
     return parts.join("\n");
   }
 
-  private buildFinalTextFromRanges(
-    ranges: Array<{ startOffset: number; endOffset: number }>,
-    totalBudget: number
-  ) {
-    const merged = this.mergeRanges(ranges);
-    let used = 0;
-    const parts: string[] = [];
-    for (const r of merged) {
-      const sz = r.endOffset - r.startOffset;
-      if (sz <= 0) continue;
-      if (used + sz > totalBudget) continue; // never cut blocks
-      parts.push(
-        this.model.getValueInRange({
-          startLineNumber: this.model.getPositionAt(r.startOffset).lineNumber,
-          startColumn: 1,
-          endLineNumber: this.model.getPositionAt(r.endOffset).lineNumber,
-          endColumn: this.lineEndColumnAtOffset(r.endOffset),
-        })
-      );
-      used += sz;
-    }
-    const text = parts.join("\n");
-    const startOffset = merged[0]?.startOffset ?? 0;
-    const endOffset = merged[merged.length - 1]?.endOffset ?? 0;
-    return { text, startOffset, endOffset };
-  }
-
   /**
    * New entrypoint: returns the tiered, ranked context (Tier A + ranked B/C/D).
    * - Keeps your existing strategies for Tier A.
