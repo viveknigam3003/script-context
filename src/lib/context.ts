@@ -1,6 +1,7 @@
 import type * as monaco from "monaco-editor";
 import { Parser, type Point, Tree, Node } from "web-tree-sitter";
 import { ensureParser } from "./treeSitterInit";
+import CODE_STOPWORDS from "./stopwords";
 
 type Position = { lineNumber: number; column: number };
 
@@ -33,6 +34,7 @@ export interface RankedSectionsOptions extends ContextOptions {
 
 export type DebugInfo = {
   titleTokens: string[];
+  queryTokens: string[];
   budgets: { A: number; B: number; C: number; D: number; total: number };
   scored: {
     B: RankedBlock[];
@@ -138,6 +140,47 @@ const W_COMP = -0.05; // gentle size penalty
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
+}
+
+function splitCamelSnake(s: string): string[] {
+  return s
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_\W]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function cutTokenize(
+  raw: string,
+  STOP: Set<string> = CODE_STOPWORDS
+): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const w of splitCamelSnake(raw.toLowerCase())) {
+    if (w.length <= 1) continue;
+    if (STOP.has(w)) continue;
+    out.push(w);
+  }
+  // dedupe while preserving order
+  const seen = new Set<string>();
+  const dedup: string[] = [];
+  for (const t of out) {
+    if (!seen.has(t)) {
+      seen.add(t);
+      dedup.push(t);
+    }
+  }
+  return dedup;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size && !b.size) return 0;
+  let inter = 0;
+  // iterate smaller for perf
+  const small = a.size <= b.size ? a : b;
+  const big = a.size <= b.size ? b : a;
+  small.forEach((t) => big.has(t) && inter++);
+  return inter / (a.size + b.size - inter);
 }
 
 export class ContextExtractor {
@@ -614,11 +657,10 @@ export class ContextExtractor {
     startOffset: number;
     endOffset: number;
   } {
-    // Walk non-named siblings backward to include contiguous comments
+    // Find the first contiguous leading //-comment line (no blank line in between)
     let startNode: Node = node;
     let p: Node | null = node.previousSibling;
     while (p && p.type === "comment") {
-      // Only include comments that are directly adjacent (no blank line between)
       const commentEndLine = p.endPosition.row;
       const nodeStartLine = startNode.startPosition.row;
       if (commentEndLine + 1 === nodeStartLine) {
@@ -628,8 +670,18 @@ export class ContextExtractor {
         break;
       }
     }
-    // Then do your normal full-line expansion
-    return this.expandNodeToFullLines(startNode);
+
+    // Start = full line of the (possibly) earliest comment,
+    // End   = full line of the original node
+    const startPos = { lineNumber: startNode.startPosition.row + 1, column: 1 };
+    const endPos = {
+      lineNumber: node.endPosition.row + 1,
+      column: this.lineEndColumn(node.endPosition.row + 1),
+    };
+    return {
+      startOffset: this.model.getOffsetAt(startPos),
+      endOffset: this.model.getOffsetAt(endPos),
+    };
   }
 
   /** Expand a node to full-line boundaries (never cut lines) */
@@ -1016,10 +1068,9 @@ export class ContextExtractor {
         child.type === "variable_declaration"
       ) {
         const container = this.wholeBlockContainer(child);
-        const { startOffset, endOffset } = (
-          this.expandNodeToFullLinesWithLeadingComments ??
-          this.expandNodeToFullLines
-        ).call(this, container);
+        const { startOffset, endOffset } =
+          this.expandNodeToFullLinesWithLeadingComments(container);
+
         out.push({ startOffset, endOffset, node: container, kind: child.type });
       }
     }
@@ -1065,10 +1116,8 @@ export class ContextExtractor {
       }
 
       const container = call; // we already prefer call expression container for tests
-      const { startOffset, endOffset } = (
-        this.expandNodeToFullLinesWithLeadingComments ??
-        this.expandNodeToFullLines
-      ).call(this, container);
+      const { startOffset, endOffset } =
+        this.expandNodeToFullLinesWithLeadingComments(container);
 
       // exclude Tier A
       if (
@@ -1147,8 +1196,10 @@ export class ContextExtractor {
       if (c.node.type === "function_declaration") {
         const nm = c.node.childForFieldName("name")?.text;
         if (nm) nameCandidates.push(nm);
+      } else if (c.kind === "pm_test") {
+        const t = this.getTestTitleFromNode(c.node);
+        if (t) nameCandidates.push(...cutTokenize(t)); // <-- add this
       } else {
-        // variables: push first declared id if any
         const defs = this.collectDefsForBlock(c.node);
         defs.forEach((d) => nameCandidates.push(d));
       }
@@ -1246,6 +1297,172 @@ export class ContextExtractor {
     return parts.join("\n");
   }
 
+  private getLineText(lineNumber: number): string {
+    return this.model.getLineContent(
+      Math.max(1, Math.min(lineNumber, this.model.getLineCount()))
+    );
+  }
+
+  // Pull contiguous single-line comments immediately above a node/line
+  private leadingCommentTextAt(lineNumber: number): string {
+    let startLine = Math.max(1, lineNumber - 1);
+    while (startLine > 0) {
+      const txt = this.model.getLineContent(startLine);
+      if (/^\s*\/\/.*/.test(txt) || /^\s*$/.test(txt)) {
+        startLine--;
+        continue;
+      }
+      break;
+    }
+    const from = startLine + 1,
+      to = Math.max(1, lineNumber - 1);
+    const parts: string[] = [];
+    for (let ln = from; ln <= to; ln++) {
+      const t = this.model.getLineContent(ln).replace(/^\s*\/\/\s?/, "");
+      if (t.trim().length) parts.push(t);
+    }
+    return parts.join(" ");
+  }
+
+  // Title from pm.test call around cursor (you already have getTestTitleFromNode)
+  private getTestTitleNearCursor(cursor: Position): string | null {
+    if (!this.tree) return null;
+    const nodeAt = this.tree.rootNode.descendantForPosition({
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    });
+    const fn = nodeAt ? this.nearestFunctionFrom(nodeAt) : null;
+    const call = fn ? this.wrapFunctionIfArgument(fn) : null;
+    return call ? this.getTestTitleFromNode(call) : null;
+  }
+
+  // Final query tokens used for similarity search
+  private buildQueryTokens(cursor: Position): string[] {
+    const line = this.getLineText(cursor.lineNumber);
+    const cmt = this.leadingCommentTextAt(cursor.lineNumber);
+    const title = this.getTestTitleNearCursor(cursor) ?? "";
+    return [...cutTokenize(line), ...cutTokenize(cmt), ...cutTokenize(title)];
+  }
+
+  // Candidates for "relevant lines": helpers, not pm.test, not plain const/let
+  private collectHelperFunctionCandidates(excludeRange?: {
+    startOffset: number;
+    endOffset: number;
+  }): BlockRange[] {
+    if (!this.tree) return [];
+    const out: BlockRange[] = [];
+    const root = this.tree.rootNode;
+
+    const pushBlock = (node: Node) => {
+      const { startOffset, endOffset } =
+        this.expandNodeToFullLinesWithLeadingComments(node);
+      if (
+        excludeRange &&
+        !(
+          endOffset <= excludeRange.startOffset ||
+          startOffset >= excludeRange.endOffset
+        )
+      ) {
+        return; // exclude Tier A overlap
+      }
+      out.push({ startOffset, endOffset, node, kind: "helper_fn" });
+    };
+
+    for (let i = 0; i < root.namedChildCount; i++) {
+      const st = root.namedChild(i)!;
+
+      // skip pm.test(...) blocks (D tier)
+      const asCall =
+        st.type === "expression_statement" ? st.namedChildren[0] : st;
+      if (asCall && asCall.type === "call_expression") {
+        const callee = asCall.child(0);
+        if (callee?.type === "member_expression") {
+          const obj = callee.child(0),
+            prop = callee.child(2);
+          if (
+            obj?.type === "identifier" &&
+            obj.text === "pm" &&
+            prop?.text === "test"
+          )
+            continue;
+        }
+      }
+
+      // include function declarations directly
+      if (st.type === "function_declaration") {
+        pushBlock(st);
+        continue;
+      }
+
+      // include const foo = () => {} or function expressions assigned to identifiers
+      if (
+        st.type === "lexical_declaration" ||
+        st.type === "variable_declaration"
+      ) {
+        const visit = (n: Node) => {
+          if (n.type === "variable_declarator") {
+            const init = n.childForFieldName("value");
+            if (
+              init &&
+              (init.type === "arrow_function" ||
+                init.type === "function" ||
+                init.type === "function_expression")
+            ) {
+              pushBlock(st); // keep the whole declaration line(s)
+            }
+          }
+          for (let j = 0; j < n.namedChildCount; j++) visit(n.namedChild(j)!);
+        };
+        visit(st);
+      }
+    }
+
+    return out.sort((a, b) => a.startOffset - b.startOffset);
+  }
+
+  private getNameAndLeadingCommentTokens(n: Node): string[] {
+    const names: string[] = [];
+    if (n.type === "function_declaration") {
+      const nm = n.childForFieldName("name")?.text ?? "";
+      names.push(nm);
+    } else if (
+      n.type === "lexical_declaration" ||
+      n.type === "variable_declaration"
+    ) {
+      let firstId = "";
+      const walk = (node: Node) => {
+        if (firstId) return;
+        if (node.type === "identifier") {
+          firstId = node.text ?? "";
+          return;
+        }
+        for (let i = 0; i < node.namedChildCount; i++)
+          walk(node.namedChild(i)!);
+      };
+      walk(n);
+      if (firstId) names.push(firstId);
+    }
+    // leading comments text
+    const startLine = n.startPosition.row + 1;
+    const cmt = this.leadingCommentTextAt(startLine);
+    return [...cutTokenize(names.join(" ")), ...cutTokenize(cmt)];
+  }
+
+  private scoreHelperSimilarity(queryTokens: string[], n: Node): number {
+    const q = new Set(queryTokens);
+    const cands = new Set(this.getNameAndLeadingCommentTokens(n));
+    const base = jaccard(q, cands); // 0..1
+    // tiny bonus if any exact name token overlaps a query token
+    let exact = 0;
+    cands.forEach((t) => {
+      if (q.has(t)) exact++;
+    });
+    const exactBoost = Math.min(0.15, exact * 0.03);
+    // tiny bonus if helper mentions any free identifier from Tier A
+    // (we’ll pass freeA externally to avoid re-traversal)
+    return Math.min(1, base + exactBoost);
+  }
+
   /**
    * New entrypoint: returns the tiered, ranked context (Tier A + ranked B/C/D).
    * - Keeps your existing strategies for Tier A.
@@ -1260,6 +1477,7 @@ export class ContextExtractor {
     const budgets = this.deriveBudgets(totalBudget, percents);
     const debug: DebugInfo = {
       titleTokens: [],
+      queryTokens: [],
       budgets: { ...budgets, total: totalBudget },
       scored: { B: [], C: [] },
       picked: { B: [], C: [] },
@@ -1289,53 +1507,92 @@ export class ContextExtractor {
     const titleTokens = this.tokenize(title);
     debug.titleTokens = titleTokens;
 
+    const queryTokens = this.buildQueryTokens(cursor);
+    debug.titleTokens = titleTokens;
+    debug.queryTokens = queryTokens; // or extend DebugInfo with queryTokens: string[]
+
     // ---- Build global index for dependency expansion
     const globalIndex = this.buildGlobalIndex();
 
-    // ---- Tier B: Globals (exclude overlap with A)
-    const globals = this.collectGlobalBlockCandidates().filter(
-      (b) =>
-        b.endOffset <= baseRange.startOffset ||
-        b.startOffset >= baseRange.endOffset
-    );
+    // ---- Tier B: Declarations (const/let/var only; exclude overlap with A)
+    const declOnly = this.collectGlobalBlockCandidates()
+      .filter(
+        (b) =>
+          b.node.type === "lexical_declaration" ||
+          b.node.type === "variable_declaration"
+      )
+      .filter(
+        (b) =>
+          b.endOffset <= baseRange.startOffset ||
+          b.startOffset >= baseRange.endOffset
+      );
+
     const rankedB = this.scoreCandidates(
-      globals,
+      declOnly,
       { ...baseRange, text: tierA.text },
       cursor,
       budgets.B,
+      /* we can pass queryTokens or titleTokens; B is mostly dependency/KIND-driven */
       titleTokens
     );
     debug.scored.B = rankedB;
-
-    const pickedB = this.selectWithinBudget(rankedB, budgets.B);
+    const pickedB = this.selectWithinBudget(
+      rankedB.filter((b) => b.endOffset - b.startOffset <= budgets.B),
+      budgets.B
+    );
     debug.picked.B = pickedB;
-    // mark skips (budget based; overlap with A was pre-filtered)
+    // mark skipped
     const pickedBSet = new Set(pickedB);
-    for (const r of rankedB) {
-      if (!pickedBSet.has(r)) {
-        const reason: "over_budget" | "overlap_A" | "tie_break" = "over_budget";
-        debug.skipped.B.push({ block: r, reason });
-      }
-    }
+    for (const r of rankedB)
+      if (!pickedBSet.has(r))
+        debug.skipped.B.push({ block: r, reason: "over_budget" });
 
-    // ---- Tier C: Other tests (exclude A)
-    const others = this.collectOtherTestBlocks(baseRange);
-    const rankedC = this.scoreCandidates(
-      others,
+    // ---- Tier C: Relevant helpers (cut-token similarity)
+    const helperCands = this.collectHelperFunctionCandidates(baseRange);
+    type ScoredCand = RankedBlock & { sim: number };
+    const scoredHelpers: ScoredCand[] = helperCands
+      .map((br) => {
+        const sim = this.scoreHelperSimilarity(queryTokens, br.node);
+        // reuse RankedBlock shape lightly (signals not needed here)
+        return {
+          ...br,
+          sizeChars: br.endOffset - br.startOffset,
+          signals: { lexical: 0, reference: 0, kind: 0, complexity: 0 },
+          score: sim,
+          sim,
+        };
+      })
+      .sort((a, b) => b.sim - a.sim || a.sizeChars - b.sizeChars);
+
+    // low-latency: take top K small ones while staying in C budget
+    const TOP_K = 3;
+    const filteredByCap = scoredHelpers
+      .filter((h) => h.endOffset - h.startOffset <= budgets.C)
+      .slice(0, 12); // tiny shortlist to keep selection cheap
+
+    const pickedC = this.selectWithinBudget(filteredByCap, budgets.C).slice(
+      0,
+      TOP_K
+    );
+    debug.scored.C = filteredByCap;
+    debug.picked.C = pickedC;
+    for (const h of filteredByCap)
+      if (!pickedC.includes(h))
+        debug.skipped.C.push({ block: h, reason: "over_budget" });
+
+    // ---- Tier D: Other tests (exclude A)
+    const testsAll = this.collectOtherTestBlocks(baseRange);
+    const rankedD = this.scoreCandidates(
+      testsAll,
       { ...baseRange, text: tierA.text },
       cursor,
-      budgets.C,
-      titleTokens
+      budgets.D,
+      queryTokens
     );
-    debug.scored.C = rankedC;
-
-    const pickedC = this.selectWithinBudget(rankedC, budgets.C);
-    debug.picked.C = pickedC;
-    const pickedCSet = new Set(pickedC);
-    for (const r of rankedC) {
-      if (!pickedCSet.has(r))
-        debug.skipped.C.push({ block: r, reason: "over_budget" });
-    }
+    const pickedD = this.selectWithinBudget(
+      rankedD.filter((b) => b.endOffset - b.startOffset <= budgets.D),
+      budgets.D
+    );
 
     // ---- One-hop dependency closure for (B + C)
     const rangesBC = [
@@ -1388,28 +1645,26 @@ export class ContextExtractor {
 
     // B: declarations (picked globals + dependency additions that are globals)
     const declRanges = depExpanded.filter((r) =>
-      globals.some(
+      declOnly.some(
         (g) => g.startOffset === r.startOffset && g.endOffset === r.endOffset
       )
     );
     const declarations = this.textFromRanges(declRanges);
 
     // C: relevantLines (non-global small helpers that slipped in; in this version, we keep empty)
-    const relevantRanges: Array<{ startOffset: number; endOffset: number }> =
-      [];
+    const relevantRanges = pickedC.map((b) => ({
+      startOffset: b.startOffset,
+      endOffset: b.endOffset,
+    }));
     const relevantLines = this.textFromRanges(relevantRanges);
 
     // D: existingTests (pickedC as full blocks OR skeletons if nothing fit)
-    let existingTests = "";
-    if (pickedC.length) {
-      existingTests = this.textFromRanges(pickedC);
-    } else {
-      // skeletons for top-2 skipped
-      const skeletons = rankedC
-        .slice(0, 2)
-        .map((r) => this.renderTestSkeleton(r.node));
-      existingTests = skeletons.join("\n");
-    }
+    const existingTests = pickedD.length
+      ? this.textFromRanges(pickedD)
+      : rankedD
+          .slice(0, 2)
+          .map((r) => this.renderTestSkeleton(r.node))
+          .join("\n");
 
     // ---- Meta & debug
     const res: ExtractRankedContextSections = {
@@ -1424,7 +1679,7 @@ export class ContextExtractor {
           A: linesAroundCursorRanges,
           B: declRanges,
           C: relevantRanges,
-          D: pickedC.map((b) => ({
+          D: pickedD.map((b) => ({
             startOffset: b.startOffset,
             endOffset: b.endOffset,
           })),
@@ -1433,8 +1688,8 @@ export class ContextExtractor {
           A: 1,
           B: declRanges.length,
           C: relevantRanges.length,
-          D: pickedC.length,
-          skeletons: pickedC.length ? 0 : Math.min(2, rankedC.length),
+          D: pickedD.length,
+          skeletons: pickedD.length ? 0 : Math.min(2, rankedD.length),
         },
         titleTokens,
       },
