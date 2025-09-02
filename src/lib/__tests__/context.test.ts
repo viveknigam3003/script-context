@@ -72,6 +72,7 @@ const createMockModel = (content: string): monaco.editor.ITextModel => {
     getLineMaxColumn: vi.fn(
       (lineNumber: number) => (lines[lineNumber - 1]?.length || 0) + 1
     ),
+    getLineContent: vi.fn((lineNumber: number) => lines[lineNumber - 1] || ""),
   } as unknown as monaco.editor.ITextModel;
 };
 

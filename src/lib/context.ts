@@ -1,37 +1,102 @@
+/**
+ * @fileoverview Context Extractor for JavaScript/TypeScript Code
+ *
+ * This module provides intelligent context extraction from code using Tree-sitter AST parsing.
+ * It extracts relevant code context around a cursor position for use with Large Language Models (LLMs).
+ *
+ * Key Features:
+ * - AST-aware context extraction
+ * - Incremental parsing for performance
+ * - Multiple extraction strategies (function-based, block-based, line-based)
+ * - Ranked context sections with dependency analysis
+ * - Support for Postman test scripts
+ *
+ * @author Vivek Nigam
+ * @version 1.0.0
+ */
+
 import type * as monaco from "monaco-editor";
 import { Parser, type Point, Tree, Node } from "web-tree-sitter";
 import { ensureParser } from "./treeSitterInit";
 import CODE_STOPWORDS from "./stopwords";
 
+// ===== TYPE DEFINITIONS =====
+
+/**
+ * Represents a position in the code editor
+ */
 type Position = { lineNumber: number; column: number };
 
+/**
+ * Configuration options for context extraction
+ */
 export interface ContextOptions {
-  // TODO: add prefix and suffix bifurcation
   /**
-   * If no function / blocks are found, number of lines above and below to include.
-   * Defaults to 5.
+   * If no function/blocks are found, number of lines above and below to include.
+   * @default 5
    */
   fallbackLineWindow?: number;
+
   /**
    * Level of context extraction for a given code block.
    * 0 => innermost function only (current behavior),
    * 1 => parent function, 2 => grandparent, etc.
-   * Max level = 50;
+   * @default 0
+   * @max 50
    */
-  nestingLevel?: number; // default 0
-  /** Hard budget for fallback & sibling strategies (approx chars).
-   * Default ~4k chars (~1k tokens).
+  nestingLevel?: number;
+
+  /**
+   * Hard budget for fallback & sibling strategies (approx chars).
+   * @default 4000 (~1k tokens)
    */
   maxCharsBudget?: number;
-  tierPercents?: { A: number; B: number; C: number; D: number }; // defaults below
-  includeLeadingComments?: boolean; // default true (you already do it)
+
+  /**
+   * Percentage allocation for different tiers
+   * @default { A: 0.4, B: 0.3, C: 0.2, D: 0.1 }
+   */
+  tierPercents?: { A: number; B: number; C: number; D: number };
+
+  /**
+   * Whether to include leading comments with code blocks
+   * @default true
+   */
+  includeLeadingComments?: boolean;
+
+  /**
+   * If true, Tier A is always raw lines around the cursor (ignores AST)
+   * @default false
+   */
+  forceRawLinesAroundCursor?: boolean;
+
+  /**
+   * Lines before cursor when using raw lines
+   * @default 5
+   */
+  rawPrefixLines?: number;
+
+  /**
+   * Lines after cursor when using raw lines
+   * @default 5
+   */
+  rawSuffixLines?: number;
 }
 
+/**
+ * Extended options for ranked context sections
+ */
 export interface RankedSectionsOptions extends ContextOptions {
-  /** Emit rich debug info about ranking/selection. */
+  /**
+   * Emit rich debug info about ranking/selection
+   * @default false
+   */
   debug?: boolean;
 }
 
+/**
+ * Debug information for context extraction analysis
+ */
 export type DebugInfo = {
   titleTokens: string[];
   queryTokens: string[];
@@ -57,15 +122,18 @@ export type DebugInfo = {
   depsAdded: Array<{ name: string; startOffset: number; endOffset: number }>;
 };
 
+/**
+ * Ranked context sections result with different tiers of relevance
+ */
 export interface ExtractRankedContextSections {
-  /** Tier A */
-  linesAroundCursor: string; // the local/test block (Tier A)
-  /** Tier B (+ dependency one-hop) */
-  declarations: string; // selected globals/const/let/var & pulled deps
-  /** Tier C (title-matched helpers or small glue picked as "most relevant") */
-  relevantLines: string; // small non-global helpers that made the cut (optional)
-  /** Other existing tests chosen for context or compact skeletons for skipped ones */
-  existingTests: string; // other pm.test(...) blocks or skeletons
+  /** Tier A: The local/test block around cursor */
+  linesAroundCursor: string;
+  /** Tier B: Selected globals/const/let/var & pulled dependencies */
+  declarations: string;
+  /** Tier C: Small non-global helpers that made the cut */
+  relevantLines: string;
+  /** Tier D: Other existing tests chosen for context or compact skeletons */
+  existingTests: string;
   /** Metadata + offsets to highlight */
   meta: {
     strategy: ExtractContextResult["strategy"];
@@ -85,25 +153,26 @@ export interface ExtractRankedContextSections {
     };
     titleTokens: string[];
   };
-  /** Optional debug payload with rankings, signals, and reasons. */
+  /** Optional debug payload with rankings, signals, and reasons */
   debug?: DebugInfo;
 }
 
-const W_TITLE = 0.2; // boosts title/name overlap
-
+/**
+ * Result of basic context extraction
+ */
 export interface ExtractContextResult {
   /**
-   * The full text slice to feed to the LLM.
+   * The full text slice to feed to the LLM
    */
   text: string;
   /**
-   * The 0-based start and end offsets (UTF-16 code units) in the model.
-   * (Useful if you want to highlight the region in the editor.)
+   * The 0-based start and end offsets (UTF-16 code units) in the model
+   * (Useful if you want to highlight the region in the editor)
    */
   startOffset: number;
   endOffset: number;
   /**
-   * What strategy was used to obtain this context.
+   * What strategy was used to obtain this context
    */
   strategy:
     | "enclosing-function"
@@ -111,7 +180,11 @@ export interface ExtractContextResult {
     | "fallback-lines";
 }
 
-// ---- Ranking model bits (NEW) ----
+// ===== RANKING MODEL TYPES =====
+
+/**
+ * Represents a code block range with AST node information
+ */
 type BlockRange = {
   startOffset: number;
   endOffset: number;
@@ -119,18 +192,23 @@ type BlockRange = {
   kind?: string;
 };
 
+/**
+ * A ranked code block with scoring signals
+ */
 type RankedBlock = BlockRange & {
   sizeChars: number;
   signals: {
-    lexical: number;
-    reference: number;
-    kind: number;
-    complexity: number;
+    lexical: number; // Distance-based relevance
+    reference: number; // Dependency-based relevance
+    kind: number; // Type-based relevance
+    complexity: number; // Size-based penalty
   };
   score: number;
 };
 
-// Treat these as "top-level block kinds" for similarity and display
+/**
+ * Types of top-level blocks for similarity and display
+ */
 type TopBlockKind =
   | "pm_test"
   | "function_declaration"
@@ -139,6 +217,9 @@ type TopBlockKind =
   | "lexical_declaration" // const/let (non-fn)
   | "variable_declaration"; // var (non-fn)
 
+/**
+ * Top-level code block with categorization
+ */
 type TopBlock = {
   kind: TopBlockKind;
   node: Node;
@@ -146,18 +227,30 @@ type TopBlock = {
   endOffset: number;
 };
 
+// ===== CONSTANTS =====
+
+/** Default percentage allocation for different context tiers */
 const DEFAULT_TIER_PERCENTS = { A: 0.4, B: 0.3, C: 0.2, D: 0.1 } as const;
 
-// Weights: tune via telemetry later
-const W_LEX = 0.3;
-const W_REF = 0.35; // a touch higher—dependencies matter a lot
-const W_KIND = 0.2;
-const W_COMP = -0.05; // gentle size penalty
+// Scoring weights - tunable via telemetry
+const W_LEX = 0.3; // Lexical proximity weight
+const W_REF = 0.35; // Reference/dependency weight (higher - dependencies matter)
+const W_KIND = 0.2; // Block type preference weight
+const W_COMP = -0.05; // Complexity penalty (negative for size penalty)
+const W_TITLE = 0.2; // Title/name overlap boost
 
-function clamp01(x: number) {
+// ===== UTILITY FUNCTIONS =====
+
+/**
+ * Clamps a value between 0 and 1
+ */
+function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
 }
 
+/**
+ * Splits camelCase and snake_case strings into individual words
+ */
 function splitCamelSnake(s: string): string[] {
   return s
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
@@ -166,6 +259,9 @@ function splitCamelSnake(s: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Tokenizes text, filters stopwords, and removes duplicates
+ */
 function cutTokenize(
   raw: string,
   STOP: Set<string> = CODE_STOPWORDS
@@ -177,7 +273,7 @@ function cutTokenize(
     if (STOP.has(w)) continue;
     out.push(w);
   }
-  // dedupe while preserving order
+  // Deduplicate while preserving order
   const seen = new Set<string>();
   const dedup: string[] = [];
   for (const t of out) {
@@ -189,25 +285,55 @@ function cutTokenize(
   return dedup;
 }
 
+/**
+ * Calculates Jaccard similarity between two sets
+ */
 function jaccard(a: Set<string>, b: Set<string>): number {
   if (!a.size && !b.size) return 0;
   let inter = 0;
-  // iterate smaller for perf
+  // Iterate smaller set for performance
   const small = a.size <= b.size ? a : b;
   const big = a.size <= b.size ? b : a;
   small.forEach((t) => big.has(t) && inter++);
   return inter / (a.size + b.size - inter);
 }
 
+// ===== MAIN CLASS =====
+
+/**
+ * ContextExtractor provides intelligent code context extraction using Tree-sitter AST parsing.
+ *
+ * Features:
+ * - Incremental parsing for performance
+ * - Multiple extraction strategies
+ * - AST-aware context boundaries
+ * - Dependency analysis and ranking
+ * - Support for JavaScript/TypeScript and Postman test scripts
+ *
+ * @example
+ * ```typescript
+ * const extractor = await ContextExtractor.create(model);
+ * const context = extractor.getContextAroundCursor({ lineNumber: 10, column: 5 });
+ * console.log(context.text);
+ * ```
+ */
 export class ContextExtractor {
+  // ===== PRIVATE PROPERTIES =====
+
+  /** Tree-sitter parser instance for JavaScript/TypeScript */
   private parser!: Parser;
 
+  /** Current AST tree, null if not yet parsed */
   private tree: Tree | null = null;
+
+  /** Whether the tree needs to be re-parsed due to changes */
   private dirty = true;
+
+  /** Timestamp of the last successful parse operation */
   private lastParseTime: number = 0;
 
   /**
-   * We store pending incremental edits between parses.
+   * Pending incremental edits between parses.
    * Each edit mirrors the data Tree-sitter expects in .edit()
    */
   private pendingEdits: Array<{
@@ -219,28 +345,49 @@ export class ContextExtractor {
     newEndPosition: Point;
   }> = [];
 
+  /** Monaco editor text model that this extractor is bound to */
   private model: monaco.editor.ITextModel;
 
+  /** Debug information from the last context extraction operation */
+  private _lastDebug: DebugInfo | null = null;
+
+  /** Reserved ranges to prevent overlap during ranked extraction */
+  private classRangeTaken: Array<{ startOffset: number; endOffset: number }> =
+    [];
+
+  // ===== CONSTRUCTOR AND FACTORY =====
+
+  /**
+   * Private constructor - use ContextExtractor.create() instead
+   * @param model Monaco text model to bind to
+   */
   private constructor(model: monaco.editor.ITextModel) {
     this.model = model;
   }
 
   /**
-   * Initialize Tree-sitter + language and return an instance bound to a Monaco model.
+   * Factory method to create and initialize a ContextExtractor instance.
+   * Initializes Tree-sitter parser and performs initial AST parsing.
    *
-   * @param model Monaco text model
-   * @param wasmUrl URL for tree-sitter-javascript.wasm (must be served by your app)
+   * @param model Monaco text model to extract context from
+   * @returns Promise resolving to initialized ContextExtractor instance
+   *
+   * @example
+   * ```typescript
+   * const model = monaco.editor.createModel(code, 'javascript');
+   * const extractor = await ContextExtractor.create(model);
+   * ```
    */
   static async create(
     model: monaco.editor.ITextModel
   ): Promise<ContextExtractor> {
-    // Use the existing treeSitterInit module
+    // Initialize Tree-sitter parser
     const parser = await ensureParser();
 
     const instance = new ContextExtractor(model);
     instance.parser = parser;
 
-    // Initial parse
+    // Perform initial parse
     instance.tree = instance.parser.parse(model.getValue());
     instance.dirty = false;
     instance.lastParseTime = Date.now();
@@ -248,8 +395,11 @@ export class ContextExtractor {
     return instance;
   }
 
+  // ===== PUBLIC API METHODS =====
+
   /**
-   * Get the current status of the AST tree
+   * Gets the current status of the AST tree
+   * @returns Object containing tree status information
    */
   getTreeStatus() {
     return {
@@ -261,21 +411,34 @@ export class ContextExtractor {
   }
 
   /**
-   * Force rebuild the AST tree immediately
+   * Forces immediate rebuild of the AST tree
+   * Useful when you need the tree to be up-to-date immediately
    */
   forceBuildTree() {
     this.ensureIncrementalParseUpToDate();
   }
 
-  private _lastDebug: DebugInfo | null = null;
-
+  /**
+   * Gets debug information from the last context extraction operation
+   * @returns Debug information or null if no extraction has been performed
+   */
   public getLastDebug(): DebugInfo | null {
     return this._lastDebug;
   }
 
   /**
+   * Handles content changes from Monaco editor.
    * Call this from Monaco's onDidChangeModelContent handler.
-   * It records incremental edits; we only re-parse on demand.
+   * Records incremental edits for efficient re-parsing.
+   *
+   * @param e Monaco content change event
+   *
+   * @example
+   * ```typescript
+   * model.onDidChangeModelContent((e) => {
+   *   extractor.onModelContentChanged(e);
+   * });
+   * ```
    */
   onModelContentChanged(e: monaco.editor.IModelContentChangedEvent) {
     const changes = [...e.changes].sort(
@@ -317,16 +480,27 @@ export class ContextExtractor {
     this.dirty = true;
   }
 
-  // Add this helper somewhere private:
+  // ===== CORE PARSING AND AST MANAGEMENT =====
+
+  /**
+   * Calculates new position after inserting text, handling multi-line insertions.
+   * Used for incremental parsing to track position changes.
+   *
+   * @param start Starting position before text insertion
+   * @param text Text that was inserted
+   * @returns New position after insertion
+   */
   private advancePointByText(start: Point, text: string): Point {
-    // Count lines in the inserted text
-    const norm = text.replace(/\r\n?/g, "\n"); // ← normalize
+    // Normalize line endings
+    const norm = text.replace(/\r\n?/g, "\n");
     const lines = norm.split("\n");
+
     if (lines.length === 1) {
-      // single-line insert
+      // Single-line insertion
       return { row: start.row, column: start.column + lines[0].length };
     }
-    // multi-line insert
+
+    // Multi-line insertion
     const lastLine = lines[lines.length - 1];
     return {
       row: start.row + (lines.length - 1),
@@ -334,6 +508,44 @@ export class ContextExtractor {
     };
   }
 
+  /**
+   * Ensures the AST tree is up-to-date by applying pending incremental edits
+   * and re-parsing if necessary. This method is called automatically before
+   * any context extraction to ensure we're working with current syntax tree.
+   */
+  private ensureIncrementalParseUpToDate() {
+    if (!this.dirty) return;
+
+    if (!this.tree) {
+      this.tree = this.parser.parse(this.model.getValue());
+      this.pendingEdits = [];
+      this.dirty = false;
+      this.lastParseTime = Date.now();
+      return;
+    }
+
+    // Apply accumulated edits to the existing tree
+    for (const e of this.pendingEdits) {
+      this.tree.edit(e);
+    }
+
+    // Incremental reparse using existing tree
+    this.tree = this.parser.parse(this.model.getValue(), this.tree);
+    this.pendingEdits = [];
+    this.dirty = false;
+    this.lastParseTime = Date.now();
+  }
+
+  // ===== NODE TYPE CHECKING AND CLASSIFICATION =====
+
+  /**
+   * Wraps a function node with its containing call expression if it's used as an argument.
+   * This ensures we capture complete constructs like `pm.test("name", function() { ... })`
+   * instead of just the inner function.
+   *
+   * @param funcNode Function node to potentially wrap
+   * @returns Original node or wrapping call/new expression
+   */
   private wrapFunctionIfArgument(funcNode: Node): Node {
     let p: Node | null = funcNode.parent;
     while (p) {
@@ -345,6 +557,13 @@ export class ContextExtractor {
     return funcNode;
   }
 
+  /**
+   * Merges overlapping and adjacent ranges into a sorted, non-overlapping list.
+   * This is essential for creating contiguous text blocks from multiple AST nodes.
+   *
+   * @param ranges Array of ranges with start and end offsets
+   * @returns Merged and sorted array of non-overlapping ranges
+   */
   private mergeRanges(
     ranges: Array<{ startOffset: number; endOffset: number }>
   ) {
@@ -362,10 +581,227 @@ export class ContextExtractor {
   }
 
   /**
-   * Returns a context slice based on cursor position following your rules:
-   * 1) enclosing function if inside one
-   * 2) else one top-level block above + one below
-   * 3) else N lines around cursor
+   * Checks if a node or any of its ancestors have parse errors or missing nodes.
+   * This helps detect unfinished or syntactically incorrect code that needs special handling.
+   *
+   * @param n Node to check (will traverse up the parent chain)
+   * @returns True if any node in the ancestor chain has errors
+   */
+  private nodeOrAncestorsHaveError(n: Node | null): boolean {
+    let p: Node | null = n;
+    // web-tree-sitter nodes support hasError() and isMissing
+    while (p) {
+      if (p.hasError || p.isMissing) return true;
+      p = p.parent;
+    }
+    return this.tree?.rootNode?.hasError ?? false;
+  }
+
+  /**
+   * Uses lightweight text heuristics to detect likely unfinished code near the cursor.
+   * Checks for unbalanced parentheses/braces and common unfinished patterns.
+   * This is much faster than deep AST analysis and catches most common cases.
+   *
+   * @param cursor Current cursor position
+   * @returns True if code appears unfinished or incomplete
+   */
+  private isLikelyUnfinishedNearCursor(cursor: Position): boolean {
+    const total = this.model.getLineCount();
+    const from = Math.max(1, cursor.lineNumber - 2);
+    const to = Math.min(total, cursor.lineNumber + 30); // small forward lookahead
+
+    const text = this.model.getValueInRange({
+      startLineNumber: from,
+      startColumn: 1,
+      endLineNumber: to,
+      endColumn: this.lineEndColumn(to),
+    });
+
+    // Count braces/parens (very lightweight; good enough for “unfinished”)
+    let paren = 0,
+      brace = 0;
+    for (const ch of text) {
+      if (ch === "(") paren++;
+      else if (ch === ")") paren = Math.max(0, paren - 1);
+      else if (ch === "{") brace++;
+      else if (ch === "}") brace = Math.max(0, brace - 1);
+    }
+
+    // Extra hint: line looks like a starting construct w/o closure nearby
+    const near = this.model.getLineContent(cursor.lineNumber);
+    const startsCallOrFn = /\b(pm\.test\s*\(|function\b|=>\s*\{?$)/.test(near);
+
+    return paren > 0 || brace > 0 || startsCallOrFn;
+  }
+
+  /**
+   * Extracts raw, contiguous full lines around the cursor without AST analysis.
+   * This is the ultimate fallback when AST parsing fails or produces unreliable results.
+   * Always returns complete lines (never cuts mid-line) to maintain syntax validity.
+   *
+   * @param cursor Current cursor position
+   * @param beforeLines Number of lines to include before cursor
+   * @param afterLines Number of lines to include after cursor
+   * @returns Context result with raw text lines
+   */
+  private rawLinesAround(
+    cursor: Position,
+    beforeLines: number,
+    afterLines: number
+  ): ExtractContextResult {
+    const total = this.model.getLineCount();
+    const startLine = Math.max(1, cursor.lineNumber - beforeLines);
+    const endLine = Math.min(total, cursor.lineNumber + afterLines);
+
+    const startOffset = this.model.getOffsetAt({
+      lineNumber: startLine,
+      column: 1,
+    });
+    const endOffset = this.model.getOffsetAt({
+      lineNumber: endLine,
+      column: this.lineEndColumn(endLine),
+    });
+
+    const text = this.model.getValueInRange({
+      startLineNumber: startLine,
+      startColumn: 1,
+      endLineNumber: endLine,
+      endColumn: this.lineEndColumn(endLine),
+    });
+
+    return { text, startOffset, endOffset, strategy: "fallback-lines" };
+  }
+
+  /**
+   * Hybrid extraction strategy for unfinished/incomplete code.
+   * Combines AST-based block detection with raw line extraction for current function.
+   *
+   * Strategy:
+   * 1. Find the current incomplete function/block using AST
+   * 2. Include the complete current block up to cursor (raw to preserve unfinished syntax)
+   * 3. Add complete neighboring blocks as context
+   * 4. Merge all ranges and return contiguous text
+   *
+   * This ensures we get meaningful context even for broken/incomplete code.
+   *
+   * @param cursor Current cursor position
+   * @param beforeLines Fallback lines before cursor if no AST context
+   * @param afterLines Fallback lines after cursor if no AST context
+   * @returns Context result with hybrid extraction
+   */
+  private hybridUnfinishedAround(
+    cursor: Position,
+    beforeLines: number,
+    afterLines: number
+  ): ExtractContextResult {
+    const total = this.model.getLineCount();
+    const startLine = Math.max(1, cursor.lineNumber - beforeLines);
+    const endLine = Math.min(total, cursor.lineNumber + afterLines);
+
+    const tsPos: Point = {
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    };
+    const nodeAt = this.tree?.rootNode.descendantForPosition(tsPos) ?? null;
+
+    // Find the unfinished container (prefer function-like wrapped in call_expression)
+    let container: Node | null = null;
+    if (nodeAt) {
+      let cur: Node | null = nodeAt;
+      while (cur) {
+        if (this.isFunctionLike(cur)) {
+          container = this.wrapFunctionIfArgument(cur);
+          break;
+        }
+        if (this.isWholeBlockCandidate(cur)) {
+          container = this.wholeBlockContainer(cur);
+          break;
+        }
+        cur = cur.parent;
+      }
+    }
+    if (!container) {
+      // Fallback: raw window
+      return this.rawLinesAround(cursor, beforeLines, afterLines);
+    }
+
+    // Raw range for the unfinished container: from its real start (with leading comments) to cursor line end
+    const unfinishedStart =
+      this.expandNodeToFullLinesWithLeadingComments(container).startOffset;
+    const unfinishedEnd = this.model.getOffsetAt({
+      lineNumber: cursor.lineNumber,
+      column: this.lineEndColumn(cursor.lineNumber),
+    });
+    const unfinishedRange = {
+      startOffset: unfinishedStart,
+      endOffset: unfinishedEnd,
+    };
+
+    // Top-level neighbors: always include prev/next whole blocks (no line-window restriction)
+    const top = this.topLevelAncestor(container) ?? container;
+    const prevTop = this.previousNamedSibling(top);
+    const nextTop = this.nextNamedSibling(top);
+
+    const neighborRanges: Array<{ startOffset: number; endOffset: number }> =
+      [];
+    const pushWhole = (n: Node | null) => {
+      if (!n) return;
+      const r = this.expandNodeToFullLinesWithLeadingComments(n);
+      neighborRanges.push(r);
+    };
+    pushWhole(prevTop);
+    pushWhole(nextTop);
+
+    // Also include any full blocks that intersect the raw window (optional, won’t slice)
+    const windowBlocks = this.collectWholeBlocksIntersectingWindow(
+      startLine,
+      endLine
+    ).map((b) => ({ startOffset: b.startOffset, endOffset: b.endOffset }));
+
+    // Build final ranges: unfinished current block + neighbors + window blocks
+    const ranges = [unfinishedRange, ...neighborRanges, ...windowBlocks];
+
+    // Merge adjacent/overlapping and produce final text
+    const merged = this.mergeRanges(ranges);
+    const startOffset = merged[0].startOffset;
+    const endOffset = merged[merged.length - 1].endOffset;
+
+    const text = this.model.getValueInRange({
+      startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
+      startColumn: 1,
+      endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
+      endColumn: this.lineEndColumnAtOffset(endOffset),
+    });
+
+    return { text, startOffset, endOffset, strategy: "fallback-lines" };
+  }
+
+  /**
+   * Extracts context around a cursor position using intelligent AST-based strategies.
+   *
+   * This is the main context extraction method that follows a hierarchical strategy:
+   * 1. Enclosing function if cursor is inside one
+   * 2. Adjacent top-level blocks (one above, one below)
+   * 3. Fallback to raw lines around cursor
+   *
+   * Special handling for unfinished/broken code:
+   * - Detects parse errors and syntax issues
+   * - Uses hybrid approach for incomplete functions
+   * - Always preserves complete blocks (never cuts mid-line)
+   *
+   * @param cursor Position in the code to extract context around
+   * @param opts Configuration options for extraction
+   * @returns Context result with text, offsets, and strategy used
+   *
+   * @example
+   * ```typescript
+   * const context = extractor.getContextAroundCursor(
+   *   { lineNumber: 42, column: 10 },
+   *   { fallbackLineWindow: 10, nestingLevel: 1 }
+   * );
+   * console.log(`Strategy: ${context.strategy}`);
+   * console.log(`Context: ${context.text}`);
+   * ```
    */
   getContextAroundCursor(
     cursor: Position,
@@ -373,20 +809,28 @@ export class ContextExtractor {
   ): ExtractContextResult {
     this.ensureIncrementalParseUpToDate();
 
+    const before = opts.rawPrefixLines ?? opts.fallbackLineWindow ?? 5;
+    const after = opts.rawSuffixLines ?? opts.fallbackLineWindow ?? 5;
+
     if (!this.tree) {
-      // Shouldn't happen, but fallback gracefully
-      return this.linesAround(cursor, opts.fallbackLineWindow ?? 5);
+      // No tree — just give raw lines.
+      return this.rawLinesAround(cursor, before, after);
     }
 
-    // Tree-sitter positions are 0-based {row, column}
     const tsPos: Point = {
       row: cursor.lineNumber - 1,
       column: cursor.column - 1,
     };
-
     const nodeAtCursor = this.tree.rootNode.descendantForPosition(tsPos);
-    if (!nodeAtCursor) {
-      return this.linesAround(cursor, opts.fallbackLineWindow ?? 5);
+
+    const shouldUseRaw =
+      !nodeAtCursor ||
+      this.nodeOrAncestorsHaveError(nodeAtCursor) ||
+      this.isLikelyUnfinishedNearCursor(cursor);
+
+    if (shouldUseRaw) {
+      // NEW: hybrid behavior — current block raw-to-cursor, others whole
+      return this.hybridUnfinishedAround(cursor, before, after);
     }
 
     // 1) Try enclosing function-like block
@@ -449,38 +893,15 @@ export class ContextExtractor {
       }
     }
 
-    // 3) Else fallback lines around cursor
-    return this.linesAround(
-      cursor,
-      opts.fallbackLineWindow ?? 5,
-      opts.maxCharsBudget
-    );
+    // 3) Final fallback: raw lines (should be rare)
+    return this.rawLinesAround(cursor, before, after);
   }
 
-  /** Apply pending edits and reparse incrementally if needed */
-  private ensureIncrementalParseUpToDate() {
-    if (!this.dirty) return;
-
-    if (!this.tree) {
-      this.tree = this.parser.parse(this.model.getValue());
-      this.pendingEdits = [];
-      this.dirty = false;
-      this.lastParseTime = Date.now();
-      return;
-    }
-
-    // Apply accumulated edits to the existing tree
-    for (const e of this.pendingEdits) {
-      this.tree.edit(e);
-    }
-
-    // Incremental reparse using existing tree
-    this.tree = this.parser.parse(this.model.getValue(), this.tree);
-    this.pendingEdits = [];
-    this.dirty = false;
-    this.lastParseTime = Date.now();
-  }
-
+  /**
+   * Checks if a node represents a function-like construct
+   * @param n Node to check
+   * @returns True if node is function-like
+   */
   private isFunctionLike(n: Node | null): boolean {
     return (
       !!n &&
@@ -494,6 +915,12 @@ export class ContextExtractor {
     );
   }
 
+  /**
+   * Checks if a node is a candidate for whole block extraction
+   * Includes functions, classes, variable declarations, control flow, etc.
+   * @param n Node to check
+   * @returns True if node should be treated as a complete block
+   */
   private isWholeBlockCandidate(n: Node): boolean {
     // Keep this focused on JS + your Postman scripts
     return (
@@ -534,7 +961,15 @@ export class ContextExtractor {
     return n;
   }
 
-  /** Return whole-block ranges that intersect a line window, but only as full nodes (no slicing). */
+  /**
+   * Collects complete block nodes that intersect with a given line window.
+   * Only returns full nodes - never slices blocks at window boundaries.
+   * This preserves syntactic integrity of code blocks.
+   *
+   * @param startLine Starting line number of the window (1-based)
+   * @param endLine Ending line number of the window (1-based)
+   * @returns Array of block ranges with their AST nodes
+   */
   private collectWholeBlocksIntersectingWindow(
     startLine: number,
     endLine: number
@@ -568,29 +1003,27 @@ export class ContextExtractor {
     return results.sort((a, b) => a.startOffset - b.startOffset);
   }
 
-  /** Pack whole blocks into a char budget (never cut). Keeps order, merges adjacency. */
-  private packBlocksWithinBudget(
-    blocks: Array<{ startOffset: number; endOffset: number }>,
-    maxChars: number
-  ): Array<{ startOffset: number; endOffset: number }> {
-    const merged = this.mergeRanges(blocks); // you already have mergeRanges
-    const packed: Array<{ startOffset: number; endOffset: number }> = [];
-    let used = 0;
+  // ===== PRIVATE UTILITY METHODS =====
 
-    for (const r of merged) {
-      const size = r.endOffset - r.startOffset;
-      if (size <= 0) continue;
-      if (used + size > maxChars) break; // stop before over-budget
-      packed.push(r);
-      used += size;
-    }
-    return packed;
-  }
-
+  /**
+   * Determines if a node represents a function body.
+   * Function bodies are the block containers for function code.
+   *
+   * @param n Node to check
+   * @returns True if node is a function body block
+   */
   private isFunctionBody(n: Node | null): boolean {
     return !!n && (n.type === "statement_block" || n.type === "function_body");
   }
 
+  /**
+   * Finds the nearest enclosing function from a given node.
+   * Traverses up the AST tree looking for function-like constructs or function bodies.
+   * Also searches within argument lists for function expressions.
+   *
+   * @param node Starting node to search from
+   * @returns Nearest function node or null if none found
+   */
   private nearestFunctionFrom(node: Node): Node | null {
     let cur: Node | null = node;
     while (cur) {
@@ -611,6 +1044,15 @@ export class ContextExtractor {
     return null;
   }
 
+  /**
+   * Elevates a function node to a higher nesting level by traversing up the AST.
+   * Used for context expansion when we want broader scope than the immediate function.
+   * Safely limits elevation to prevent infinite traversal.
+   *
+   * @param funcNode Starting function node
+   * @param levels Number of function nesting levels to traverse upward
+   * @returns Elevated function node (or original if elevation not possible)
+   */
   private elevateFunctionByLevels(funcNode: Node, levels: number): Node {
     if (levels <= 0) return funcNode;
     const safeLevels = Math.min(Math.max(levels, 0), 50);
@@ -657,18 +1099,40 @@ export class ContextExtractor {
     return last && last.parent === this.tree?.rootNode ? last : null;
   }
 
+  /**
+   * Gets the previous named sibling node, skipping any missing/error nodes.
+   * Missing nodes are placeholder nodes created by the parser for incomplete syntax.
+   *
+   * @param node Node to find the previous sibling for
+   * @returns Previous named sibling or null if none exists
+   */
   private previousNamedSibling(node: Node): Node | null {
     let prev = node.previousNamedSibling;
     while (prev && prev.isMissing) prev = prev.previousNamedSibling;
     return prev ?? null;
   }
 
+  /**
+   * Gets the next named sibling node, skipping any missing/error nodes.
+   * Missing nodes are placeholder nodes created by the parser for incomplete syntax.
+   *
+   * @param node Node to find the next sibling for
+   * @returns Next named sibling or null if none exists
+   */
   private nextNamedSibling(node: Node): Node | null {
     let next = node.nextNamedSibling;
     while (next && next.isMissing) next = next.nextNamedSibling;
     return next ?? null;
   }
 
+  /**
+   * Expands a node to include leading comments and full line boundaries.
+   * Searches backwards for contiguous comment lines and includes them in the range.
+   * This preserves important context like JSDoc comments and inline explanations.
+   *
+   * @param node Node to expand
+   * @returns Range with start/end offsets including comments and full lines
+   */
   private expandNodeToFullLinesWithLeadingComments(node: Node): {
     startOffset: number;
     endOffset: number;
@@ -700,7 +1164,13 @@ export class ContextExtractor {
     };
   }
 
-  /** Expand a node to full-line boundaries (never cut lines) */
+  /**
+   * Expands a node to full line boundaries without including leading comments.
+   * Ensures that extracted text never cuts lines in the middle to maintain readability.
+   *
+   * @param node Node to expand to full lines
+   * @returns Range with start/end offsets aligned to line boundaries
+   */
   private expandNodeToFullLines(node: Node): {
     startOffset: number;
     endOffset: number;
@@ -721,121 +1191,32 @@ export class ContextExtractor {
     return { startOffset: fullStartOffset, endOffset: fullEndOffset };
   }
 
-  /** Fallback: N lines above and below cursor, clamped to file bounds */
-  /** Fallback: prefer whole blocks intersecting a small window; never cut. */
-  private linesAround(
-    cursor: Position,
-    window: number,
-    maxCharsBudget?: number
-  ): ExtractContextResult {
-    const totalLines = this.model.getLineCount();
-    const startLine = Math.max(1, cursor.lineNumber - window);
-    const endLine = Math.min(totalLines, cursor.lineNumber + window);
-
-    // 1) Collect whole blocks that intersect the line window
-    const blocks = this.collectWholeBlocksIntersectingWindow(
-      startLine,
-      endLine
-    );
-
-    // 2) If we found blocks, include them as whole nodes within budget
-    const budget = Math.max(0, maxCharsBudget ?? 4000); // ~1k tokens by default
-    if (blocks.length > 0) {
-      const packed = this.packBlocksWithinBudget(
-        blocks.map((b) => ({
-          startOffset: b.startOffset,
-          endOffset: b.endOffset,
-        })),
-        budget
-      );
-      if (packed.length > 0) {
-        const merged = this.mergeRanges(packed);
-        const startOffset = merged[0].startOffset;
-        const endOffset = merged[merged.length - 1].endOffset;
-
-        const text = this.model.getValueInRange({
-          startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
-          startColumn: 1,
-          endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-          endColumn: this.lineEndColumnAtOffset(endOffset),
-        });
-
-        return { text, startOffset, endOffset, strategy: "fallback-lines" };
-      }
-    }
-
-    // 3) If no whole block fits, return the *nearest* single statement (whole) if any
-    //    This avoids returning syntactically broken snippets.
-    const nodeAtCursor = this.tree!.rootNode.descendantForPosition({
-      row: cursor.lineNumber - 1,
-      column: cursor.column - 1,
-    });
-    if (nodeAtCursor) {
-      // Try the nearest function; if none, nearest top-level statement
-      const f = this.nearestFunctionFrom(nodeAtCursor);
-      if (f) {
-        const container = this.wrapFunctionIfArgument(f);
-        const { startOffset, endOffset } =
-          this.expandNodeToFullLines(container);
-        const size = endOffset - startOffset;
-        if (size <= budget) {
-          const text = this.model.getValueInRange({
-            startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
-            startColumn: 1,
-            endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-            endColumn: this.lineEndColumnAtOffset(endOffset),
-          });
-          return { text, startOffset, endOffset, strategy: "fallback-lines" };
-        }
-      }
-
-      // Fall back to the cursor's top-level ancestor as a whole statement if it fits
-      const top = this.topLevelAncestor(nodeAtCursor);
-      if (top) {
-        const { startOffset, endOffset } = this.expandNodeToFullLines(
-          this.wholeBlockContainer(top)
-        );
-        const size = endOffset - startOffset;
-        if (size <= budget) {
-          const text = this.model.getValueInRange({
-            startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
-            startColumn: 1,
-            endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-            endColumn: this.lineEndColumnAtOffset(endOffset),
-          });
-          return { text, startOffset, endOffset, strategy: "fallback-lines" };
-        }
-      }
-    }
-
-    // 4) As absolute last resort, return *just the current full line* (never mid-line).
-    //    This keeps syntax valid (at least a complete line), even if not very useful.
-    const startOffset = this.model.getOffsetAt({
-      lineNumber: cursor.lineNumber,
-      column: 1,
-    });
-    const endOffset = this.model.getOffsetAt({
-      lineNumber: cursor.lineNumber,
-      column: this.lineEndColumn(cursor.lineNumber),
-    });
-    const text = this.model.getValueInRange({
-      startLineNumber: cursor.lineNumber,
-      startColumn: 1,
-      endLineNumber: cursor.lineNumber,
-      endColumn: this.lineEndColumn(cursor.lineNumber),
-    });
-    return { text, startOffset, endOffset, strategy: "fallback-lines" };
-  }
-
+  /**
+   * Gets the maximum column number for a given line
+   */
   private lineEndColumn(lineNumber: number): number {
     return this.model.getLineMaxColumn(lineNumber);
   }
 
+  /**
+   * Gets the ending column position for a line, accounting for the actual line length.
+   *
+   * @param endOffset Character offset in the document
+   * @returns Column number at the end of the line containing the offset
+   */
   private lineEndColumnAtOffset(endOffset: number): number {
     const endPos = this.model.getPositionAt(endOffset);
     return this.lineEndColumn(endPos.lineNumber);
   }
 
+  /**
+   * Extracts the test title from a pm.test() call expression.
+   * Parses AST node to find the first string argument of pm.test calls.
+   * Handles simple template strings and strips quotes/backticks.
+   *
+   * @param node AST node to analyze (should be call_expression)
+   * @returns Test title string or null if not a valid pm.test call
+   */
   private getTestTitleFromNode(node: Node): string | null {
     // pm.test(<title>, <fn>)
     if (node.type !== "call_expression") return null;
@@ -864,6 +1245,14 @@ export class ContextExtractor {
     return null;
   }
 
+  /**
+   * Tokenizes a string into lowercase alphanumeric tokens for similarity analysis.
+   * Removes special characters and splits on whitespace. Used for fuzzy matching
+   * and semantic similarity scoring between code sections.
+   *
+   * @param s String to tokenize
+   * @returns Array of lowercase alphanumeric tokens
+   */
   private tokenize(s: string | null | undefined): string[] {
     if (!s) return [];
     return s
@@ -873,7 +1262,14 @@ export class ContextExtractor {
       .filter(Boolean);
   }
 
-  // Identifiers read/called inside a node, minus those defined within the node itself
+  /**
+   * Analyzes a node to find free identifiers (variables/functions used but not defined).
+   * This helps determine dependencies between code sections for context ranking.
+   * Collects identifiers that are read/called but excludes those defined within the node.
+   *
+   * @param node AST node to analyze
+   * @returns Set of free identifier names
+   */
   private freeIdentifiersOf(node: Node): Set<string> {
     const reads = new Set<string>();
     const defs = new Set<string>();
@@ -913,7 +1309,13 @@ export class ContextExtractor {
     return reads;
   }
 
-  // Map "name" -> BlockRange for resolvable globals
+  /**
+   * Builds an index mapping global identifier names to their defining block ranges.
+   * This enables quick lookup of where variables and functions are defined
+   * for dependency resolution during context extraction.
+   *
+   * @returns Map from identifier name to its defining BlockRange
+   */
   private buildGlobalIndex(): Map<string, BlockRange> {
     const map = new Map<string, BlockRange>();
     const globals = this.collectGlobalBlockCandidates();
@@ -943,7 +1345,17 @@ export class ContextExtractor {
     return map;
   }
 
-  // Add globals needed by selected blocks (one hop), without slicing or blowing the budget
+  /**
+   * Expands selected blocks by including their dependencies (one-hop resolution).
+   * Analyzes free identifiers in picked blocks and adds global definitions they reference.
+   * Respects budget constraints to avoid including too much context.
+   *
+   * @param picked Currently selected block ranges
+   * @param globalIndex Map of identifier names to their defining blocks
+   * @param already Ranges already included in the context
+   * @param budgetLeft Remaining character budget for additional context
+   * @returns Expanded array of ranges including dependencies
+   */
   private expandWithDependencies(
     picked: BlockRange[],
     globalIndex: Map<string, BlockRange>,
@@ -1031,7 +1443,14 @@ export class ContextExtractor {
     return { reads, calls };
   }
 
-  // Definitions exported by a block (function names, const/let/var ids)
+  /**
+   * Collects all definitions (function names, variable names) exported by a block.
+   * This helps identify what symbols a block makes available to other code.
+   * Used for dependency analysis and avoiding duplicate definitions.
+   *
+   * @param n Block node to analyze for definitions
+   * @returns Set of identifier names defined by this block
+   */
   private collectDefsForBlock(n: Node): Set<string> {
     const defs = new Set<string>();
     const add = (name?: string | null) => {
@@ -1102,7 +1521,14 @@ export class ContextExtractor {
     return out;
   }
 
-  // Other test call blocks (pm.test(...)) except Tier A
+  /**
+   * Collects pm.test() call blocks excluding a specific range (usually Tier A).
+   * Searches for test blocks in the global scope and returns them with metadata.
+   * These form Tier B context in the ranking system.
+   *
+   * @param excludeRange Optional range to exclude from results (e.g., current context)
+   * @returns Array of test block ranges with their AST nodes
+   */
   private collectOtherTestBlocks(excludeRange?: {
     startOffset: number;
     endOffset: number;
@@ -1282,6 +1708,14 @@ export class ContextExtractor {
     return out;
   }
 
+  /**
+   * Creates a compact skeleton representation of a pm.test() call.
+   * Useful for displaying test structure without full implementation details.
+   * Extracts the test name from the first argument and shows simplified syntax.
+   *
+   * @param node AST node representing a pm.test() call
+   * @returns Skeleton string like 'pm.test("testname", function () { ... });'
+   */
   private renderTestSkeleton(node: Node): string {
     // try to pull the test name: pm.test("Name", ...)
     const arg0 = node.childForFieldName("arguments")?.namedChildren?.[0];
@@ -1292,6 +1726,14 @@ export class ContextExtractor {
     return `pm.test(${lit}, function () { ... });`;
   }
 
+  /**
+   * Calculates character budgets for each tier based on total available characters.
+   * Distributes the total budget according to percentage allocation for tiers A-D.
+   *
+   * @param totalChars Total character budget available
+   * @param perc Percentage allocation for each tier (defaults to DEFAULT_TIER_PERCENTS)
+   * @returns Budget object with character allocations for each tier
+   */
   private deriveBudgets(
     totalChars: number,
     perc: { A: number; B: number; C: number; D: number } = DEFAULT_TIER_PERCENTS
@@ -1304,6 +1746,14 @@ export class ContextExtractor {
     return { A, B, C, D, total: A + B + C + D };
   }
 
+  /**
+   * Converts an array of offset ranges to concatenated text strings.
+   * Extracts text from the Monaco model for each range and joins with newlines.
+   * Ensures proper line boundaries and handles edge cases gracefully.
+   *
+   * @param ranges Array of character offset ranges to extract
+   * @returns Concatenated text from all ranges
+   */
   private textFromRanges(
     ranges: Array<{ startOffset: number; endOffset: number }>
   ): string {
@@ -1349,7 +1799,13 @@ export class ContextExtractor {
     return parts.join(" ");
   }
 
-  // Title from pm.test call around cursor (you already have getTestTitleFromNode)
+  /**
+   * Finds the test title from a pm.test() call near the cursor position.
+   * Traverses up the AST to find the nearest function and checks if it's wrapped in a pm.test call.
+   *
+   * @param cursor Current cursor position
+   * @returns Test title string or null if no pm.test call found
+   */
   private getTestTitleNearCursor(cursor: Position): string | null {
     if (!this.tree) return null;
     const nodeAt = this.tree.rootNode.descendantForPosition({
@@ -1361,7 +1817,14 @@ export class ContextExtractor {
     return call ? this.getTestTitleFromNode(call) : null;
   }
 
-  // Final query tokens used for similarity search
+  /**
+   * Builds query tokens for similarity search from context around cursor.
+   * Combines tokens from current line text, leading comments, and test titles.
+   * These tokens are used for semantic matching with other code sections.
+   *
+   * @param cursor Current cursor position
+   * @returns Array of tokenized strings for similarity analysis
+   */
   private buildQueryTokens(cursor: Position): string[] {
     const line = this.getLineText(cursor.lineNumber);
     const cmt = this.leadingCommentTextAt(cursor.lineNumber);
@@ -1369,6 +1832,14 @@ export class ContextExtractor {
     return [...cutTokenize(line), ...cutTokenize(cmt), ...cutTokenize(title)];
   }
 
+  /**
+   * Extracts name and comment tokens from a node for similarity analysis.
+   * Gets function/variable names and leading comment text to build semantic tokens.
+   * Used for ranking code sections based on textual similarity.
+   *
+   * @param n AST node to extract tokens from
+   * @returns Array of name and comment tokens
+   */
   private getNameAndLeadingCommentTokens(n: Node): string[] {
     const names: string[] = [];
 
@@ -1442,6 +1913,15 @@ export class ContextExtractor {
     ];
   }
 
+  /**
+   * @deprecated Will be removed in next iteration
+   * Calculates similarity score between query tokens and a node's content.
+   * Uses Jaccard similarity with small bonuses for exact token matches.
+   *
+   * @param queryTokens Tokens from the query context
+   * @param n Node to score for similarity
+   * @returns Similarity score between 0 and 1
+   */
   // @ts-expect-error - Will be removed in next iteration
   private scoreHelperSimilarity(queryTokens: string[], n: Node): number {
     const q = new Set(queryTokens);
@@ -1458,7 +1938,13 @@ export class ContextExtractor {
     return Math.min(1, base + exactBoost);
   }
 
-  // Collect **all** top-level blocks we care about (functions, arrow-fn decls, pm.test, other decls)
+  /**
+   * Collects all top-level blocks in the file that are candidates for context extraction.
+   * Includes functions, pm.test() calls, variable declarations, and other statements.
+   * Categorizes each block by type for different ranking strategies.
+   *
+   * @returns Array of top-level blocks with their types and ranges
+   */
   private collectTopLevelBlocks(): TopBlock[] {
     if (!this.tree) return [];
     const root = this.tree.rootNode;
@@ -1561,6 +2047,14 @@ export class ContextExtractor {
   }
 
   // Tokens around the current edit: nearest function (with leading comment) else current line + its comment
+  /**
+   * Extracts tokens from the current editing context for similarity analysis.
+   * If cursor is inside a function, extracts tokens from the entire function.
+   * Otherwise, falls back to current line and associated comments.
+   *
+   * @param cursor Current cursor position
+   * @returns Object with tokens array and the range they represent
+   */
   private tokensForCurrentEdit(cursor: Position): {
     tokens: string[];
     range: { startOffset: number; endOffset: number };
@@ -1654,15 +2148,24 @@ export class ContextExtractor {
   ) {
     return !(a.endOffset <= b.startOffset || a.startOffset >= b.endOffset);
   }
+  /**
+   * Filters items to exclude those that overlap with already taken ranges.
+   * Used to prevent duplicate context extraction and ensure clean tier separation.
+   *
+   * @param items Array of items to filter
+   * @param taken Array of already allocated ranges
+   * @returns Filtered array with non-overlapping items only
+   */
   private filterNonOverlapping<
     T extends { startOffset: number; endOffset: number }
   >(items: T[], taken: Array<{ startOffset: number; endOffset: number }>) {
     return items.filter((it) => !taken.some((t) => this.overlaps(it, t)));
   }
 
-  private classRangeTaken: Array<{ startOffset: number; endOffset: number }> =
-    [];
-
+  /**
+   * Reserves ranges to prevent overlap during ranked extraction
+   * @param ranges Array of ranges to reserve
+   */
   private reserveRanges(
     ranges: Array<{ startOffset: number; endOffset: number }>
   ) {
@@ -1677,6 +2180,44 @@ export class ContextExtractor {
     this.classRangeTaken = [];
   }
 
+  /**
+   * Extracts ranked context sections organized into multiple tiers based on relevance.
+   *
+   * This advanced method provides a multi-tier context extraction system:
+   * - Tier A (40%): Local context around cursor (current function/block)
+   * - Tier B (30%): Global declarations and dependencies
+   * - Tier C (20%): Relevant helper functions and utilities
+   * - Tier D (10%): Other test blocks and compact skeletons
+   *
+   * Features:
+   * - Smart dependency analysis and one-hop expansion
+   * - Similarity-based ranking using Jaccard coefficients
+   * - Budget management to stay within token limits
+   * - Overlap prevention between tiers
+   * - Rich debug information for analysis
+   *
+   * @param cursor Position in the code to extract context around
+   * @param opts Configuration options including debug flag and tier percentages
+   * @returns Ranked context sections with metadata and optional debug info
+   *
+   * @example
+   * ```typescript
+   * const ranked = extractor.getRankedContextSections(
+   *   { lineNumber: 42, column: 10 },
+   *   { debug: true, maxCharsBudget: 12000 }
+   * );
+   *
+   * console.log('Tier A (Local):', ranked.linesAroundCursor);
+   * console.log('Tier B (Globals):', ranked.declarations);
+   * console.log('Tier C (Helpers):', ranked.relevantLines);
+   * console.log('Tier D (Tests):', ranked.existingTests);
+   *
+   * if (ranked.debug) {
+   *   console.log('Budget allocation:', ranked.debug.budgets);
+   *   console.log('Scoring details:', ranked.debug.scored);
+   * }
+   * ```
+   */
   public getRankedContextSections(
     cursor: Position,
     opts: RankedSectionsOptions = {}
@@ -1700,7 +2241,9 @@ export class ContextExtractor {
     // ---- Tier A (always exactly one slice) ----
     const tierA = this.getContextAroundCursor(cursor, {
       ...opts,
-      maxCharsBudget: budgets.A,
+      rawPrefixLines: opts.rawPrefixLines ?? 5, // tune as you like
+      rawSuffixLines: opts.rawSuffixLines ?? 5,
+      maxCharsBudget: undefined, // irrelevant for raw lines
     });
     const baseRange = {
       startOffset: tierA.startOffset,
