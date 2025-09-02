@@ -82,6 +82,10 @@ class ContextExtractorModule {
     },
   };
 
+  /** Reserved ranges to prevent overlap during ranked extraction */
+  private classRangeTaken: Array<{ startOffset: number; endOffset: number }> =
+    [];
+
   /**
    * Monaco editor text model
    */
@@ -243,6 +247,38 @@ class ContextExtractorModule {
     return funcNode;
   }
 
+  private rawLinesAround(
+    cursor: Position,
+    beforeLines: number,
+    afterLines: number
+  ): {
+    text: string;
+    startOffset: number;
+    endOffset: number;
+  } {
+    const total = this.model.getLineCount();
+    const startLine = Math.max(1, cursor.lineNumber - beforeLines);
+    const endLine = Math.min(total, cursor.lineNumber + afterLines);
+
+    const startOffset = this.model.getOffsetAt({
+      lineNumber: startLine,
+      column: 1,
+    });
+    const endOffset = this.model.getOffsetAt({
+      lineNumber: endLine,
+      column: this.lineEndColumn(endLine),
+    });
+
+    const text = this.model.getValueInRange({
+      startLineNumber: startLine,
+      startColumn: 1,
+      endLineNumber: endLine,
+      endColumn: this.lineEndColumn(endLine),
+    });
+
+    return { text, startOffset, endOffset };
+  }
+
   /**
    * Get the prefix lines based on the current cursor position.
    * Rules:
@@ -253,10 +289,9 @@ class ContextExtractorModule {
    * @param cursorPosition Current Cursor Position
    * @param options Context Extractor Options to get relevant values
    */
-  getLinesAroundCursor({
-    cursorPosition,
-    nestingLevel,
-  }: ContextExtractorOptions = ContextExtractorDefaultConfig) {
+  getLinesAroundCursor(
+    options: ContextExtractorOptions = ContextExtractorDefaultConfig
+  ) {
     // Ensure AST is up to date
     this.ensureIncrementalParseUpToDate();
 
@@ -264,59 +299,93 @@ class ContextExtractorModule {
       console.error(
         "🚀 ~ ContextExtractorModule ~ getPrefixLines ~ No AST available"
       );
-      return "";
+      return {
+        text: "",
+        startOffset: 0,
+        endOffset: 0,
+      };
     }
 
     // Use AST-aware extraction
     const tsPos: Point = {
-      row: cursorPosition.lineNumber - 1,
-      column: cursorPosition.column - 1,
+      row: options.cursorPosition.lineNumber - 1,
+      column: options.cursorPosition.column - 1,
     };
 
     const nodeAtCursor = this.tree.rootNode.descendantForPosition(tsPos);
     if (!nodeAtCursor) {
       // Fallback if cursor position is invalid
-      return "";
+      return {
+        text: "",
+        startOffset: 0,
+        endOffset: 0,
+      };
     }
 
-    const innerFunction = this.nearestFunctionFrom(nodeAtCursor);
-
-    const blocks: string[] = [];
-
-    // Case 1: We're inside a function
-    if (innerFunction) {
-      const targetFunction = this.elevateFunctionByLevels(
-        innerFunction,
-        nestingLevel
+    // 1) Try enclosing function-like block
+    const innerFunc = this.nearestFunctionFrom(nodeAtCursor);
+    if (innerFunc) {
+      const targetFunc = this.elevateFunctionByLevels(
+        innerFunc,
+        options.nestingLevel
       );
 
-      // Special case: If function is an argument, take the entire construct
-      const container = this.wrapFunctionIfArgument(targetFunction);
+      // Keep the behavior: if the selected function is used as an argument,
+      // wrap to the call/new expression so we don’t miss the closing parens.
+      const container = this.wrapFunctionIfArgument(targetFunc);
 
       const { startOffset, endOffset } =
         this.expandNodeToFullLinesWithLeadingComments(container);
-
-      blocks.push(
-        this.model.getValueInRange({
+      return {
+        text: this.model.getValueInRange({
           startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
           startColumn: 1,
           endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-          endColumn: this.model.getLineMaxColumn(
-            this.model.getPositionAt(endOffset).lineNumber
-          ),
-        })
-      );
+          endColumn: this.lineEndColumnAtOffset(endOffset),
+        }),
+        startOffset,
+        endOffset,
+      };
     }
 
-    // Scan for `prefixLines` above the current function
-    // If the currentLine - prefixLines lands inside a block, take that block
+    // 2) Else top-level siblings (one above, one below)
+    const topLevel = this.topLevelAncestor(nodeAtCursor);
+    if (topLevel) {
+      const prev = this.previousNamedSibling(topLevel);
+      const next = this.nextNamedSibling(topLevel);
 
-    // Scan for `suffixLines` below the current function
-    // If the currentLine + suffixLines lands inside a block, take that block
+      // Include the current top-level node too if asked
+      const blocks: Array<{ startOffset: number; endOffset: number }> = [];
 
-    // Check for token budget of linesAroundCursor
-    // Remove the blocks which go over budget, divide the prefix and suffix budget in half
-    return blocks.length > 0 ? blocks.join("\n") : "// No blocks detected";
+      blocks.push(this.expandNodeToFullLinesWithLeadingComments(topLevel));
+      if (prev)
+        blocks.push(this.expandNodeToFullLinesWithLeadingComments(prev));
+      if (next)
+        blocks.push(this.expandNodeToFullLinesWithLeadingComments(next));
+
+      if (blocks.length > 0) {
+        const merged = this.mergeRanges(blocks);
+        const startOffset = merged[0].startOffset;
+        const endOffset = merged[merged.length - 1].endOffset;
+
+        return {
+          text: this.model.getValueInRange({
+            startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
+            startColumn: 1,
+            endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
+            endColumn: this.lineEndColumnAtOffset(endOffset),
+          }),
+          startOffset,
+          endOffset,
+        };
+      }
+    }
+
+    return this.rawLinesAround(
+      options.cursorPosition,
+      options.prefixLines,
+      options.suffixLines
+    );
   }
 
   /** MONACO HELPERS */
@@ -326,6 +395,40 @@ class ContextExtractorModule {
    */
   private lineEndColumn(lineNumber: number): number {
     return this.model.getLineMaxColumn(lineNumber);
+  }
+
+  /**
+   * Gets the ending column position for a line, accounting for the actual line length.
+   *
+   * @param endOffset Character offset in the document
+   * @returns Column number at the end of the line containing the offset
+   */
+  private lineEndColumnAtOffset(endOffset: number): number {
+    const endPos = this.model.getPositionAt(endOffset);
+    return this.lineEndColumn(endPos.lineNumber);
+  }
+
+  /**
+   * Merges overlapping and adjacent ranges into a sorted, non-overlapping list.
+   * This is essential for creating contiguous text blocks from multiple AST nodes.
+   *
+   * @param ranges Array of ranges with start and end offsets
+   * @returns Merged and sorted array of non-overlapping ranges
+   */
+  private mergeRanges(
+    ranges: Array<{ startOffset: number; endOffset: number }>
+  ) {
+    const sorted = ranges.slice().sort((a, b) => a.startOffset - b.startOffset);
+    const out: typeof sorted = [];
+    for (const r of sorted) {
+      const last = out[out.length - 1];
+      if (!last || r.startOffset >= last.endOffset) {
+        out.push({ ...r });
+      } else {
+        last.endOffset = Math.max(last.endOffset, r.endOffset);
+      }
+    }
+    return out;
   }
 
   /** AST HELPERS */
@@ -356,35 +459,6 @@ class ContextExtractorModule {
       cur = cur.parent;
     }
     return null;
-  }
-
-  /**
-   * Determines if a node represents a function body.
-   * Function bodies are the block containers for function code.
-   *
-   * @param n Node to check
-   * @returns True if node is a function body block
-   */
-  private isFunctionBody(n: Node | null): boolean {
-    return !!n && (n.type === "statement_block" || n.type === "function_body");
-  }
-
-  /**
-   * Checks if a node represents a function-like construct
-   * @param n Node to check
-   * @returns True if node is function-like
-   */
-  private isFunctionLike(n: Node | null): boolean {
-    return (
-      !!n &&
-      (n.type === "function_declaration" ||
-        n.type === "function_expression" ||
-        n.type === "arrow_function" ||
-        n.type === "method_definition" ||
-        n.type === "generator_function" ||
-        n.type === "class_method" ||
-        n.type === "function")
-    );
   }
 
   /** Return the highest ancestor that is a direct child of the root (i.e., a top-level statement) */
@@ -423,6 +497,35 @@ class ContextExtractorModule {
     let next = node.nextNamedSibling;
     while (next && next.isMissing) next = next.nextNamedSibling;
     return next ?? null;
+  }
+
+  /**
+   * Determines if a node represents a function body.
+   * Function bodies are the block containers for function code.
+   *
+   * @param n Node to check
+   * @returns True if node is a function body block
+   */
+  private isFunctionBody(n: Node | null): boolean {
+    return !!n && (n.type === "statement_block" || n.type === "function_body");
+  }
+
+  /**
+   * Checks if a node represents a function-like construct
+   * @param n Node to check
+   * @returns True if node is function-like
+   */
+  private isFunctionLike(n: Node | null): boolean {
+    return (
+      !!n &&
+      (n.type === "function_declaration" ||
+        n.type === "function_expression" ||
+        n.type === "arrow_function" ||
+        n.type === "method_definition" ||
+        n.type === "generator_function" ||
+        n.type === "class_method" ||
+        n.type === "function")
+    );
   }
 
   /**
@@ -507,6 +610,20 @@ class ContextExtractorModule {
     return current;
   }
 
+  /**
+   * Reserves ranges to prevent overlap during ranked extraction
+   * @param ranges Array of ranges to reserve
+   */
+  private reserveRanges(
+    ranges: Array<{ startOffset: number; endOffset: number }>
+  ) {
+    for (const r of ranges)
+      this.classRangeTaken.push({
+        startOffset: r.startOffset,
+        endOffset: r.endOffset,
+      });
+  }
+
   /** PUBLIC FUNCTIONS */
   public getDebugMetrics(): DebugConfig {
     return this.lastDebugMetrics;
@@ -516,11 +633,17 @@ class ContextExtractorModule {
     config: ContextExtractorOptions
   ): ExtractedContext {
     const linesAroundCursor = this.getLinesAroundCursor(config);
+    const baseRange = {
+      startOffset: linesAroundCursor.startOffset,
+      endOffset: linesAroundCursor.endOffset,
+    };
+    const linesAroundCursorRanges = [baseRange];
+    this.reserveRanges(linesAroundCursorRanges);
 
     const debug = this.getDebugMetrics();
 
     return {
-      linesAroundCursor,
+      linesAroundCursor: linesAroundCursor.text,
       debug,
     };
   }

@@ -81,6 +81,18 @@ export interface ContextOptions {
    * @default 5
    */
   rawSuffixLines?: number;
+
+  /**
+   * Number of lines to scan before cursor position for prefix context
+   * @default 5
+   */
+  numberOfPrefixLines?: number;
+
+  /**
+   * Number of lines to scan after cursor position for suffix context
+   * @default 5
+   */
+  numberOfSuffixLines?: number;
 }
 
 /**
@@ -177,7 +189,9 @@ export interface ExtractContextResult {
   strategy:
     | "enclosing-function"
     | "adjacent-top-level-blocks"
-    | "fallback-lines";
+    | "fallback-lines"
+    | "top-level-with-syntax-sanity"
+    | "enclosing-block-with-context";
 }
 
 // ===== RANKING MODEL TYPES =====
@@ -779,10 +793,9 @@ export class ContextExtractor {
   /**
    * Extracts context around a cursor position using intelligent AST-based strategies.
    *
-   * This is the main context extraction method that follows a hierarchical strategy:
-   * 1. Enclosing function if cursor is inside one
-   * 2. Adjacent top-level blocks (one above, one below)
-   * 3. Fallback to raw lines around cursor
+   * This method implements a two-case strategy based on cursor position:
+   * Case (a): Cursor at top level - Use prefix/suffix lines with syntax sanity
+   * Case (b): Cursor inside block - Take entire block + prefix/suffix from block boundaries
    *
    * Special handling for unfinished/broken code:
    * - Detects parse errors and syntax issues
@@ -797,7 +810,7 @@ export class ContextExtractor {
    * ```typescript
    * const context = extractor.getContextAroundCursor(
    *   { lineNumber: 42, column: 10 },
-   *   { fallbackLineWindow: 10, nestingLevel: 1 }
+   *   { numberOfPrefixLines: 10, numberOfSuffixLines: 10 }
    * );
    * console.log(`Strategy: ${context.strategy}`);
    * console.log(`Context: ${context.text}`);
@@ -809,19 +822,31 @@ export class ContextExtractor {
   ): ExtractContextResult {
     this.ensureIncrementalParseUpToDate();
 
-    const before = opts.rawPrefixLines ?? opts.fallbackLineWindow ?? 5;
-    const after = opts.rawSuffixLines ?? opts.fallbackLineWindow ?? 5;
+    // Get configuration values with fallbacks
+    const prefixLines =
+      opts.numberOfPrefixLines ??
+      opts.rawPrefixLines ??
+      opts.fallbackLineWindow ??
+      5;
+    const suffixLines =
+      opts.numberOfSuffixLines ??
+      opts.rawSuffixLines ??
+      opts.fallbackLineWindow ??
+      5;
 
     if (!this.tree) {
-      // No tree — just give raw lines.
-      return this.rawLinesAround(cursor, before, after);
+      // No tree — just give raw lines with syntax sanity
+      const { startLine, endLine } = this.expandWithSyntaxSanity(
+        cursor.lineNumber - prefixLines,
+        cursor.lineNumber + suffixLines
+      );
+      return this.extractLinesRange(startLine, endLine, "fallback-lines");
     }
 
-    const tsPos: Point = {
+    const nodeAtCursor = this.tree.rootNode.descendantForPosition({
       row: cursor.lineNumber - 1,
       column: cursor.column - 1,
-    };
-    const nodeAtCursor = this.tree.rootNode.descendantForPosition(tsPos);
+    });
 
     const shouldUseRaw =
       !nodeAtCursor ||
@@ -829,72 +854,114 @@ export class ContextExtractor {
       this.isLikelyUnfinishedNearCursor(cursor);
 
     if (shouldUseRaw) {
-      // NEW: hybrid behavior — current block raw-to-cursor, others whole
-      return this.hybridUnfinishedAround(cursor, before, after);
+      // Fallback to hybrid behavior for broken/unfinished code
+      return this.hybridUnfinishedAround(cursor, prefixLines, suffixLines);
     }
 
-    // 1) Try enclosing function-like block
-    const innerFunc = this.nearestFunctionFrom(nodeAtCursor);
-    if (innerFunc) {
-      const nestingLevel = opts.nestingLevel ?? 0; // CHANGED: default to innermost
-      const targetFunc = this.elevateFunctionByLevels(innerFunc, nestingLevel);
+    // Determine if cursor is at top level or inside a block
+    const isAtTopLevel = this.isCursorAtTopLevel(cursor);
 
-      // Keep the behavior: if the selected function is used as an argument,
-      // wrap to the call/new expression so we don’t miss the closing parens.
-      const container = this.wrapFunctionIfArgument(targetFunc);
+    if (isAtTopLevel) {
+      // Case (a): Cursor at top level - use prefix/suffix with syntax sanity
+      const { startLine, endLine } = this.expandWithSyntaxSanity(
+        cursor.lineNumber - prefixLines,
+        cursor.lineNumber + suffixLines
+      );
+      return this.extractLinesRange(
+        startLine,
+        endLine,
+        "top-level-with-syntax-sanity"
+      );
+    } else {
+      // Case (b): Cursor inside block - take entire block + prefix/suffix from boundaries
+      const enclosingBlock = this.getCurrentEnclosingBlock(cursor);
 
-      const { startOffset, endOffset } = this.expandNodeToFullLines(container);
-      return {
-        text: this.model.getValueInRange({
-          startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
-          startColumn: 1,
-          endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-          endColumn: this.lineEndColumnAtOffset(endOffset),
-        }),
-        startOffset,
-        endOffset,
-        strategy: "enclosing-function",
-      };
-    }
+      if (enclosingBlock) {
+        // Get the topmost parent of the current block (top-level ancestor)
+        const topmostParent =
+          this.topLevelAncestor(enclosingBlock) ?? enclosingBlock;
 
-    // 2) Else top-level siblings (one above, one below)
-    const topLevel = this.topLevelAncestor(nodeAtCursor);
-    if (topLevel) {
-      const prev = this.previousNamedSibling(topLevel);
-      const next = this.nextNamedSibling(topLevel);
+        // Expand the current block to full lines with comments
+        const blockRange =
+          opts.includeLeadingComments ?? true
+            ? this.expandNodeToFullLinesWithLeadingComments(enclosingBlock)
+            : this.expandNodeToFullLines(enclosingBlock);
 
-      // Include the current top-level node too if asked
-      const blocks: Array<{ startOffset: number; endOffset: number }> = [];
-      const expand = (n: Node) =>
-        opts.includeLeadingComments ?? true
-          ? this.expandNodeToFullLinesWithLeadingComments(n)
-          : this.expandNodeToFullLines(n);
+        // Get the topmost parent's boundaries
+        const parentRange = this.expandNodeToFullLines(topmostParent);
+        const parentStartLine = this.model.getPositionAt(
+          parentRange.startOffset
+        ).lineNumber;
+        const parentEndLine = this.model.getPositionAt(
+          parentRange.endOffset
+        ).lineNumber;
 
-      blocks.push(expand(topLevel));
-      if (prev) blocks.push(expand(prev));
-      if (next) blocks.push(expand(next));
+        // Calculate prefix/suffix from the topmost parent boundaries
+        const { startLine: prefixStart } = this.expandWithSyntaxSanity(
+          parentStartLine - prefixLines,
+          parentStartLine - 1
+        );
 
-      if (blocks.length > 0) {
-        const merged = this.mergeRanges(blocks);
-        const startOffset = merged[0].startOffset;
-        const endOffset = merged[merged.length - 1].endOffset;
+        const { endLine: suffixEnd } = this.expandWithSyntaxSanity(
+          parentEndLine + 1,
+          parentEndLine + suffixLines
+        );
 
-        return {
-          text: this.model.getValueInRange({
-            startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
-            startColumn: 1,
-            endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-            endColumn: this.lineEndColumnAtOffset(endOffset),
-          }),
-          startOffset,
-          endOffset,
-          strategy: "adjacent-top-level-blocks",
-        };
+        // Combine: prefix + current block + suffix
+        const finalStartLine = Math.min(
+          prefixStart,
+          this.model.getPositionAt(blockRange.startOffset).lineNumber
+        );
+        const finalEndLine = Math.max(
+          suffixEnd,
+          this.model.getPositionAt(blockRange.endOffset).lineNumber
+        );
+
+        return this.extractLinesRange(
+          finalStartLine,
+          finalEndLine,
+          "enclosing-block-with-context"
+        );
+      } else {
+        // Fallback if we can't find an enclosing block
+        const { startLine, endLine } = this.expandWithSyntaxSanity(
+          cursor.lineNumber - prefixLines,
+          cursor.lineNumber + suffixLines
+        );
+        return this.extractLinesRange(startLine, endLine, "fallback-lines");
       }
     }
+  }
 
-    // 3) Final fallback: raw lines (should be rare)
-    return this.rawLinesAround(cursor, before, after);
+  /**
+   * Helper method to extract text from a line range and return as ExtractContextResult
+   * @param startLine Starting line (1-based)
+   * @param endLine Ending line (1-based)
+   * @param strategy Strategy name for the result
+   * @returns Context result with extracted text
+   */
+  private extractLinesRange(
+    startLine: number,
+    endLine: number,
+    strategy: ExtractContextResult["strategy"]
+  ): ExtractContextResult {
+    const startOffset = this.model.getOffsetAt({
+      lineNumber: startLine,
+      column: 1,
+    });
+    const endOffset = this.model.getOffsetAt({
+      lineNumber: endLine,
+      column: this.lineEndColumn(endLine),
+    });
+
+    const text = this.model.getValueInRange({
+      startLineNumber: startLine,
+      startColumn: 1,
+      endLineNumber: endLine,
+      endColumn: this.lineEndColumn(endLine),
+    });
+
+    return { text, startOffset, endOffset, strategy };
   }
 
   /**
@@ -1014,6 +1081,170 @@ export class ContextExtractor {
    */
   private isFunctionBody(n: Node | null): boolean {
     return !!n && (n.type === "statement_block" || n.type === "function_body");
+  }
+
+  /**
+   * Determines if the cursor is at the top level (not inside any block/function).
+   * A cursor is considered at top level if it's not inside any function, class, or block statement.
+   *
+   * @param cursor Current cursor position
+   * @returns True if cursor is at top level, false if inside a block
+   */
+  private isCursorAtTopLevel(cursor: Position): boolean {
+    if (!this.tree) return true; // If no AST, assume top level
+
+    const tsPos: Point = {
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    };
+    const nodeAtCursor = this.tree.rootNode.descendantForPosition(tsPos);
+
+    if (!nodeAtCursor) return true;
+
+    // Walk up the AST to see if we're inside any block-like structure
+    let current: Node | null = nodeAtCursor;
+    while (current && current !== this.tree.rootNode) {
+      // Check if we're inside a function, class, or block statement
+      if (
+        this.isFunctionLike(current) ||
+        current.type === "class_declaration" ||
+        current.type === "statement_block" ||
+        current.type === "block_statement" ||
+        current.type === "function_body" ||
+        // Also check for control flow blocks
+        current.type === "if_statement" ||
+        current.type === "for_statement" ||
+        current.type === "for_in_statement" ||
+        current.type === "for_of_statement" ||
+        current.type === "while_statement" ||
+        current.type === "do_statement" ||
+        current.type === "try_statement" ||
+        current.type === "catch_clause" ||
+        current.type === "finally_clause" ||
+        current.type === "switch_statement"
+      ) {
+        return false; // We're inside a block
+      }
+      current = current.parent;
+    }
+
+    return true; // We're at top level
+  }
+
+  /**
+   * Gets the current enclosing block node that contains the cursor.
+   * Returns the nearest block-like ancestor (function, class, control flow, etc.)
+   *
+   * @param cursor Current cursor position
+   * @returns The enclosing block node or null if at top level
+   */
+  private getCurrentEnclosingBlock(cursor: Position): Node | null {
+    if (!this.tree) return null;
+
+    const tsPos: Point = {
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    };
+    const nodeAtCursor = this.tree.rootNode.descendantForPosition(tsPos);
+
+    if (!nodeAtCursor) return null;
+
+    // Walk up to find the nearest enclosing block
+    let current: Node | null = nodeAtCursor;
+    while (current && current !== this.tree.rootNode) {
+      if (
+        this.isFunctionLike(current) ||
+        current.type === "class_declaration" ||
+        current.type === "statement_block" ||
+        current.type === "block_statement" ||
+        current.type === "function_body" ||
+        current.type === "if_statement" ||
+        current.type === "for_statement" ||
+        current.type === "for_in_statement" ||
+        current.type === "for_of_statement" ||
+        current.type === "while_statement" ||
+        current.type === "do_statement" ||
+        current.type === "try_statement" ||
+        current.type === "catch_clause" ||
+        current.type === "finally_clause" ||
+        current.type === "switch_statement"
+      ) {
+        return current;
+      }
+      current = current.parent;
+    }
+
+    return null; // No enclosing block found
+  }
+
+  /**
+   * Expands prefix/suffix lines while maintaining syntax sanity.
+   * If the expansion would cut into the middle of a block, includes the entire block.
+   *
+   * @param startLine Starting line for expansion (1-based)
+   * @param endLine Ending line for expansion (1-based)
+   * @returns Adjusted range that doesn't cut blocks in the middle
+   */
+  private expandWithSyntaxSanity(
+    startLine: number,
+    endLine: number
+  ): { startLine: number; endLine: number } {
+    if (!this.tree) {
+      return { startLine, endLine };
+    }
+
+    const totalLines = this.model.getLineCount();
+    let adjustedStart = Math.max(1, startLine);
+    let adjustedEnd = Math.min(totalLines, endLine);
+
+    // Check if startLine cuts into a block
+    const startPos: Point = { row: adjustedStart - 1, column: 0 };
+    const startNode = this.tree.rootNode.descendantForPosition(startPos);
+
+    if (startNode) {
+      // Find if we're cutting into a block
+      let current: Node | null = startNode;
+      while (current && current !== this.tree.rootNode) {
+        if (this.isWholeBlockCandidate(current)) {
+          const blockStartLine = current.startPosition.row + 1;
+          const blockEndLine = current.endPosition.row + 1;
+
+          // If our start line is in the middle of this block, include the whole block
+          if (adjustedStart > blockStartLine && adjustedStart <= blockEndLine) {
+            adjustedStart = blockStartLine;
+            break;
+          }
+        }
+        current = current.parent;
+      }
+    }
+
+    // Check if endLine cuts into a block
+    const endPos: Point = { row: adjustedEnd - 1, column: 0 };
+    const endNode = this.tree.rootNode.descendantForPosition(endPos);
+
+    if (endNode) {
+      // Find if we're cutting into a block
+      let current: Node | null = endNode;
+      while (current && current !== this.tree.rootNode) {
+        if (this.isWholeBlockCandidate(current)) {
+          const blockStartLine = current.startPosition.row + 1;
+          const blockEndLine = current.endPosition.row + 1;
+
+          // If our end line is in the middle of this block, include the whole block
+          if (adjustedEnd >= blockStartLine && adjustedEnd < blockEndLine) {
+            adjustedEnd = blockEndLine;
+            break;
+          }
+        }
+        current = current.parent;
+      }
+    }
+
+    return {
+      startLine: Math.max(1, adjustedStart),
+      endLine: Math.min(totalLines, adjustedEnd),
+    };
   }
 
   /**

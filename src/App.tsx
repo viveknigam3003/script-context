@@ -1,9 +1,13 @@
 import { IconCodeDots } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
-import type { ExtractedContext } from "./lib/ContextExtractor";
-import ContextExtractorModule from "./lib/ContextExtractor";
+// import type { ExtractedContext } from "./lib/ContextExtractor";
+// import ContextExtractorModule from "./lib/ContextExtractor";
 import { monaco } from "./lib/monacoSetup";
+import {
+  ContextExtractor,
+  type ExtractRankedContextSections,
+} from "./lib/context";
 
 function App() {
   const [errors, setErrors] = useState<string[]>([]);
@@ -28,14 +32,14 @@ function App() {
     useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const outputEditorInstance =
     useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
-  const contextExtractor = useRef<ContextExtractorModule | null>(null);
+  const contextExtractor = useRef<ContextExtractor | null>(null);
   const modelDisposable = useRef<monaco.IDisposable | null>(null);
   const debounceTimeoutRef = useRef<number | null>(null);
 
   // Update tree status
   const updateTreeStatus = useCallback(() => {
     if (contextExtractor.current) {
-      setTreeStatus(contextExtractor.current.treeStatus);
+      setTreeStatus(contextExtractor.current.getTreeStatus());
     }
   }, []);
 
@@ -47,7 +51,7 @@ function App() {
 
     debounceTimeoutRef.current = window.setTimeout(() => {
       if (contextExtractor.current) {
-        contextExtractor.current.buildTree();
+        contextExtractor.current.forceBuildTree();
         updateTreeStatus();
       }
     }, 500);
@@ -161,9 +165,7 @@ pm.test("Check if zip code is valid", function () {
         console.log("Initializing context extractor...");
         try {
           // Remove the hardcoded WASM path parameter
-          contextExtractor.current = await ContextExtractorModule.createTree(
-            model
-          );
+          contextExtractor.current = await ContextExtractor.create(model);
           console.log("Context extractor initialized successfully");
           updateTreeStatus(); // Initial status update
 
@@ -201,11 +203,24 @@ pm.test("Check if zip code is valid", function () {
     };
   }, [updateTreeStatus, debouncedRebuildTree]);
 
-  const combineSectionsForPreview = (s: ExtractedContext): string => {
-    return [s.linesAroundCursor].filter(Boolean).join("\n\n");
+  // const combineSectionsForPreview = (s: ExtractedContext): string => {
+  //   return [s.linesAroundCursor].filter(Boolean).join("\n\n");
+  // };
+
+  const combineSectionsForPreview = (
+    s: ExtractRankedContextSections
+  ): string => {
+    return [
+      s.linesAroundCursor,
+      // s.declarations,
+      // s.relevantLines,
+      // s.existingTests,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   };
 
-  const printDebugLogs = (sections: ExtractedContext) => {
+  const printDebugLogs = (sections: ExtractRankedContextSections) => {
     // Inspect tuning signals
     console.log("=== Context Extraction Debug Info ===");
     console.log(sections.debug);
@@ -245,18 +260,13 @@ pm.test("Check if zip code is valid", function () {
       }
 
       // Ranked Results
-      const sections = contextExtractor.current.getExtractedContext({
-        cursorPosition: position,
-        prefixLines: 3,
-        suffixLines: 3,
-        nestingLevel: 10,
-        tokenBudgets: {
-          total: 1000,
-          sections: {
-            linesAroundCursor: 0.5,
-          },
-        },
-      });
+      const sections = contextExtractor.current.getRankedContextSections(
+        position,
+        {
+          debug: true,
+          maxCharsBudget: 1000,
+        }
+      );
       console.log("🚀 ~ App ~ sections:", sections);
 
       printDebugLogs(sections);
