@@ -1,11 +1,9 @@
-import { useState, useCallback, useEffect, useRef } from "react";
 import { IconCodeDots } from "@tabler/icons-react";
-import { monaco } from "./lib/monacoSetup";
-import {
-  ContextExtractor,
-  type ExtractRankedContextSections,
-} from "./lib/context";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
+import type { ExtractedContext } from "./lib/ContextExtractor";
+import ContextExtractorModule from "./lib/ContextExtractor";
+import { monaco } from "./lib/monacoSetup";
 
 function App() {
   const [errors, setErrors] = useState<string[]>([]);
@@ -30,14 +28,14 @@ function App() {
     useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const outputEditorInstance =
     useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
-  const contextExtractor = useRef<ContextExtractor | null>(null);
+  const contextExtractor = useRef<ContextExtractorModule | null>(null);
   const modelDisposable = useRef<monaco.IDisposable | null>(null);
   const debounceTimeoutRef = useRef<number | null>(null);
 
   // Update tree status
   const updateTreeStatus = useCallback(() => {
     if (contextExtractor.current) {
-      setTreeStatus(contextExtractor.current.getTreeStatus());
+      setTreeStatus(contextExtractor.current.treeStatus);
     }
   }, []);
 
@@ -49,22 +47,10 @@ function App() {
 
     debounceTimeoutRef.current = window.setTimeout(() => {
       if (contextExtractor.current) {
-        contextExtractor.current.forceBuildTree();
+        contextExtractor.current.buildTree();
         updateTreeStatus();
       }
     }, 500);
-  }, [updateTreeStatus]);
-
-  // Manual tree sync
-  const syncTree = useCallback(() => {
-    if (contextExtractor.current) {
-      if (debounceTimeoutRef.current) {
-        clearTimeout(debounceTimeoutRef.current);
-        debounceTimeoutRef.current = null;
-      }
-      contextExtractor.current.forceBuildTree();
-      updateTreeStatus();
-    }
   }, [updateTreeStatus]);
 
   // Beautify code function
@@ -96,7 +82,37 @@ function App() {
 
       try {
         console.log("Creating Monaco model...");
-        const model = monaco.editor.createModel("", "javascript");
+        const defaultCode = `const joi = pm.require('npm:joi@18.0.1');
+pm.test("Check for response code to be 200", function () {
+    pm.response.to.have.status(200);
+});
+
+const responseSchema = joi.object({
+    zip: joi.string().required(),
+    name: joi.string().required(),
+    address: joi.string().required(),
+    city: joi.string().required(),
+    state: joi.string().required(),
+    phone: joi.number().required()
+});
+
+const responseBody = pm.response.json(); 
+
+// Test for specific values in the response body 
+pm.test("Check for zip code to be 94105", function () { 
+    pm.expect(responseBody.zip).to.eql("94105");
+});
+
+// Test for zip code value 
+function validateZip(zip) {
+    const zipSchema = joi.string().length(5).pattern(/^\\d+$/);
+    return zipSchema.validate(zip).error === undefined; 
+}
+
+pm.test("Check if zip code is valid", function () { 
+    
+});`;
+        const model = monaco.editor.createModel(defaultCode, "javascript");
         console.log("Model created successfully");
 
         console.log("Creating input editor...");
@@ -113,6 +129,7 @@ function App() {
             wordWrap: "on",
           }
         );
+
         console.log("Input editor created successfully");
 
         console.log("Creating output editor...");
@@ -144,7 +161,9 @@ function App() {
         console.log("Initializing context extractor...");
         try {
           // Remove the hardcoded WASM path parameter
-          contextExtractor.current = await ContextExtractor.create(model);
+          contextExtractor.current = await ContextExtractorModule.createTree(
+            model
+          );
           console.log("Context extractor initialized successfully");
           updateTreeStatus(); // Initial status update
 
@@ -182,45 +201,16 @@ function App() {
     };
   }, [updateTreeStatus, debouncedRebuildTree]);
 
-  const combineSectionsForPreview = (
-    s: ExtractRankedContextSections
-  ): string => {
-    return [
-      s.linesAroundCursor,
-      s.declarations,
-      s.relevantLines,
-      s.existingTests,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
+  const combineSectionsForPreview = (s: ExtractedContext): string => {
+    return [s.linesAroundCursor].filter(Boolean).join("\n\n");
   };
 
-  const printDebugLogs = (sections: ExtractRankedContextSections) => {
+  const printDebugLogs = (sections: ExtractedContext) => {
     // Inspect tuning signals
-    console.log("=== Context Sections ===");
-    console.log("Lines Around Cursor:\n\n", sections.linesAroundCursor);
-    console.log("Declarations:\n\n", sections.declarations);
-    console.log("Relevant Lines:\n\n", sections.relevantLines);
-    console.log("Existing Tests:\n\n", sections.existingTests);
     console.log("=== Context Extraction Debug Info ===");
-    console.log(sections.meta);
-    console.table(
-      sections.debug?.picked.B.map((x) => ({
-        score: x.score.toFixed(3),
-        kind: x.kind,
-        size: x.sizeChars,
-        lex: x.signals.lexical.toFixed(2),
-        ref: x.signals.reference.toFixed(2),
-        title: (
-          x.score -
-          (0.3 * x.signals.lexical +
-            0.35 * x.signals.reference +
-            0.2 * x.signals.kind -
-            0.05 * x.signals.complexity)
-        ).toFixed(2), // W_TITLE contrib
-      }))
-    );
-    console.table(sections.debug?.depsAdded);
+    console.log(sections.debug);
+    console.log("=== Lines around ===");
+    console.log(sections.linesAroundCursor);
   };
 
   // Function for processing code using the context extractor
@@ -247,16 +237,6 @@ function App() {
         return;
       }
 
-      const inputText = model.getValue();
-      if (!inputText.trim()) {
-        const outputModel = outputEditorInstance.current?.getModel();
-        if (outputModel) {
-          outputModel.setValue("// No input provided");
-        }
-        setErrors(["No input code provided"]);
-        return;
-      }
-
       // Get current cursor position
       const position = inputEditorInstance.current.getPosition();
       if (!position) {
@@ -264,32 +244,22 @@ function App() {
         return;
       }
 
-      // Extract context using the context extractor
-      // const result = contextExtractor.current.getContextAroundCursor(position, {
-      //   fallbackLineWindow: 6,
-      //   nestingLevel: 10,
-      // });
-
       // Ranked Results
-      const sections = contextExtractor.current.getRankedContextSections(
-        position,
-        {
-          maxCharsBudget: 100,
-          fallbackLineWindow: 6,
-          nestingLevel: 10, // climb to pm.test wrapper when inside callbacks
-          includeLeadingComments: true,
-          tierPercents: { A: 0.4, B: 0.3, C: 0.2, D: 0.1 },
-        }
-      );
+      const sections = contextExtractor.current.getExtractedContext({
+        cursorPosition: position,
+        prefixLines: 3,
+        suffixLines: 3,
+        nestingLevel: 10,
+        tokenBudgets: {
+          total: 1000,
+          sections: {
+            linesAroundCursor: 0.5,
+          },
+        },
+      });
+      console.log("🚀 ~ App ~ sections:", sections);
 
       printDebugLogs(sections);
-
-      // Display the extracted context
-      setExtractionStats({
-        strategy: sections.meta.strategy,
-        totalChars: sections.meta.budgets.total,
-      });
-
       // Update output editor
       if (outputEditorInstance.current) {
         const outputModel = outputEditorInstance.current.getModel();
@@ -400,31 +370,19 @@ function App() {
             )}
             {treeStatus && (
               <div className="tree-status">
-                <div className="tree-status-header">
-                  <span className="tree-status-label">AST Tree Status:</span>
-                  <button
-                    className="sync-tree-button"
-                    onClick={syncTree}
-                    title="Force sync AST tree"
-                  >
-                    🔄 Sync Tree
-                  </button>
+                <div
+                  className={`status-indicator ${
+                    treeStatus.isDirty ? "dirty" : "clean"
+                  }`}
+                >
+                  {treeStatus.isDirty ? "🔄 Dirty" : "✅ Clean"}
                 </div>
-                <div className="tree-status-details">
-                  <span
-                    className={`status-indicator ${
-                      treeStatus.isDirty ? "dirty" : "clean"
-                    }`}
-                  >
-                    {treeStatus.isDirty ? "🔄 Dirty" : "✅ Clean"}
-                  </span>
-                  <span className="pending-edits">
-                    {treeStatus.pendingEditsCount} pending edits
-                  </span>
-                  <span className="last-parse">
-                    Last parsed:{" "}
-                    {new Date(treeStatus.lastParseTime).toLocaleTimeString()}
-                  </span>
+                <div className="pending-edits">
+                  {treeStatus.pendingEditsCount} pending edits
+                </div>
+                <div className="last-parse">
+                  Last parsed:{" "}
+                  {new Date(treeStatus.lastParseTime).toLocaleTimeString()}
                 </div>
               </div>
             )}

@@ -261,18 +261,16 @@
 
 /* Tree Status Styles */
 .tree-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
   padding: 0.75rem;
   background: #2d2d30;
   border-radius: 4px;
   width: 100%;
+  font-size: 0.8rem;
   border: 1px solid #3e3e42;
-}
-
-.tree-status-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 0.5rem;
 }
 
 .tree-status-label {
