@@ -130,6 +130,22 @@ type RankedBlock = BlockRange & {
   score: number;
 };
 
+// Treat these as "top-level block kinds" for similarity and display
+type TopBlockKind =
+  | "pm_test"
+  | "function_declaration"
+  | "arrow_function_decl" // const x = () => {}
+  | "function_expression_decl" // const x = function () {}
+  | "lexical_declaration" // const/let (non-fn)
+  | "variable_declaration"; // var (non-fn)
+
+type TopBlock = {
+  kind: TopBlockKind;
+  node: Node;
+  startOffset: number;
+  endOffset: number;
+};
+
 const DEFAULT_TIER_PERCENTS = { A: 0.4, B: 0.3, C: 0.2, D: 0.1 } as const;
 
 // Weights: tune via telemetry later
@@ -1071,7 +1087,16 @@ export class ContextExtractor {
         const { startOffset, endOffset } =
           this.expandNodeToFullLinesWithLeadingComments(container);
 
-        out.push({ startOffset, endOffset, node: container, kind: child.type });
+        // Normalize kinds for consistent exclusion logic
+        let kind = child.type;
+        if (
+          child.type === "lexical_declaration" ||
+          child.type === "variable_declaration"
+        ) {
+          kind = "declaration";
+        }
+
+        out.push({ startOffset, endOffset, node: container, kind });
       }
     }
     return out;
@@ -1344,91 +1369,18 @@ export class ContextExtractor {
     return [...cutTokenize(line), ...cutTokenize(cmt), ...cutTokenize(title)];
   }
 
-  // Candidates for "relevant lines": helpers, not pm.test, not plain const/let
-  private collectHelperFunctionCandidates(excludeRange?: {
-    startOffset: number;
-    endOffset: number;
-  }): BlockRange[] {
-    if (!this.tree) return [];
-    const out: BlockRange[] = [];
-    const root = this.tree.rootNode;
-
-    const pushBlock = (node: Node) => {
-      const { startOffset, endOffset } =
-        this.expandNodeToFullLinesWithLeadingComments(node);
-      if (
-        excludeRange &&
-        !(
-          endOffset <= excludeRange.startOffset ||
-          startOffset >= excludeRange.endOffset
-        )
-      ) {
-        return; // exclude Tier A overlap
-      }
-      out.push({ startOffset, endOffset, node, kind: "helper_fn" });
-    };
-
-    for (let i = 0; i < root.namedChildCount; i++) {
-      const st = root.namedChild(i)!;
-
-      // skip pm.test(...) blocks (D tier)
-      const asCall =
-        st.type === "expression_statement" ? st.namedChildren[0] : st;
-      if (asCall && asCall.type === "call_expression") {
-        const callee = asCall.child(0);
-        if (callee?.type === "member_expression") {
-          const obj = callee.child(0),
-            prop = callee.child(2);
-          if (
-            obj?.type === "identifier" &&
-            obj.text === "pm" &&
-            prop?.text === "test"
-          )
-            continue;
-        }
-      }
-
-      // include function declarations directly
-      if (st.type === "function_declaration") {
-        pushBlock(st);
-        continue;
-      }
-
-      // include const foo = () => {} or function expressions assigned to identifiers
-      if (
-        st.type === "lexical_declaration" ||
-        st.type === "variable_declaration"
-      ) {
-        const visit = (n: Node) => {
-          if (n.type === "variable_declarator") {
-            const init = n.childForFieldName("value");
-            if (
-              init &&
-              (init.type === "arrow_function" ||
-                init.type === "function" ||
-                init.type === "function_expression")
-            ) {
-              pushBlock(st); // keep the whole declaration line(s)
-            }
-          }
-          for (let j = 0; j < n.namedChildCount; j++) visit(n.namedChild(j)!);
-        };
-        visit(st);
-      }
-    }
-
-    return out.sort((a, b) => a.startOffset - b.startOffset);
-  }
-
   private getNameAndLeadingCommentTokens(n: Node): string[] {
     const names: string[] = [];
+
+    // 1) Function / variable name
     if (n.type === "function_declaration") {
       const nm = n.childForFieldName("name")?.text ?? "";
-      names.push(nm);
+      if (nm) names.push(nm);
     } else if (
       n.type === "lexical_declaration" ||
       n.type === "variable_declaration"
     ) {
+      // first identifier on the LHS
       let firstId = "";
       const walk = (node: Node) => {
         if (firstId) return;
@@ -1442,12 +1394,55 @@ export class ContextExtractor {
       walk(n);
       if (firstId) names.push(firstId);
     }
-    // leading comments text
+
+    // 2) Leading comment text
     const startLine = n.startPosition.row + 1;
     const cmt = this.leadingCommentTextAt(startLine);
-    return [...cutTokenize(names.join(" ")), ...cutTokenize(cmt)];
+
+    // 3) A few body identifiers + string literal words (bounded for latency)
+    const bodyTokens: string[] = [];
+    const limitIds = 20; // small cap to keep this O(1)
+    let seen = 0;
+
+    const collectBody = (node: Node) => {
+      if (seen >= limitIds) return;
+
+      if (node.type === "identifier") {
+        const txt = node.text ?? "";
+        if (txt) {
+          bodyTokens.push(txt);
+          seen++;
+        }
+      } else if (node.type === "string" || node.type === "template_string") {
+        // pull words from literals to help with semantics like "schema", "valid", etc.
+        const raw = this.model.getValueInRange({
+          startLineNumber: node.startPosition.row + 1,
+          startColumn: node.startPosition.column + 1,
+          endLineNumber: node.endPosition.row + 1,
+          endColumn: node.endPosition.column + 1,
+        });
+        bodyTokens.push(
+          ...splitCamelSnake(raw.replace(/^['"`]/, "").replace(/['"`]$/, ""))
+        );
+      }
+
+      for (let i = 0; i < node.namedChildCount && seen < limitIds; i++) {
+        collectBody(node.namedChild(i)!);
+      }
+    };
+
+    // walk the node to sample tokens
+    collectBody(n);
+
+    // tokenize + stopword filter
+    return [
+      ...cutTokenize(names.join(" ")),
+      ...cutTokenize(cmt),
+      ...cutTokenize(bodyTokens.join(" ")),
+    ];
   }
 
+  // @ts-expect-error - Will be removed in next iteration
   private scoreHelperSimilarity(queryTokens: string[], n: Node): number {
     const q = new Set(queryTokens);
     const cands = new Set(this.getNameAndLeadingCommentTokens(n));
@@ -1463,18 +1458,235 @@ export class ContextExtractor {
     return Math.min(1, base + exactBoost);
   }
 
-  /**
-   * New entrypoint: returns the tiered, ranked context (Tier A + ranked B/C/D).
-   * - Keeps your existing strategies for Tier A.
-   * - Adds Globals (B) and Test skeletons/blocks (C), then Behavioral (D, TODO hook).
-   */
+  // Collect **all** top-level blocks we care about (functions, arrow-fn decls, pm.test, other decls)
+  private collectTopLevelBlocks(): TopBlock[] {
+    if (!this.tree) return [];
+    const root = this.tree.rootNode;
+    const blocks: TopBlock[] = [];
+
+    const push = (node: Node, kind: TopBlockKind) => {
+      const { startOffset, endOffset } =
+        this.expandNodeToFullLinesWithLeadingComments(node);
+      blocks.push({ kind, node, startOffset, endOffset });
+    };
+
+    for (let i = 0; i < root.namedChildCount; i++) {
+      const st = root.namedChild(i)!;
+
+      // pm.test(...) as expression or direct call
+      const asCall =
+        st.type === "expression_statement" ? st.namedChildren[0] : st;
+      if (asCall?.type === "call_expression") {
+        const callee = asCall.child(0);
+        if (callee?.type === "member_expression") {
+          const obj = callee.child(0);
+          const prop = callee.child(2);
+          if (
+            obj?.type === "identifier" &&
+            obj.text === "pm" &&
+            prop?.text === "test"
+          ) {
+            push(asCall, "pm_test");
+            continue;
+          }
+        }
+      }
+
+      // function declaration
+      if (st.type === "function_declaration") {
+        push(st, "function_declaration");
+        continue;
+      }
+
+      // const/let/var (detect arrow/function initializer vs plain decl)
+      if (
+        st.type === "lexical_declaration" ||
+        st.type === "variable_declaration"
+      ) {
+        let hasArrow = false;
+        let hasFuncExpr = false;
+        const walk = (n: Node) => {
+          if (n.type === "arrow_function") hasArrow = true;
+          if (n.type === "function_expression" || n.type === "function")
+            hasFuncExpr = true;
+          for (let j = 0; j < n.namedChildCount; j++) walk(n.namedChild(j)!);
+        };
+        walk(st);
+        if (hasArrow) push(st, "arrow_function_decl");
+        else if (hasFuncExpr) push(st, "function_expression_decl");
+        else push(st, st.type as TopBlockKind);
+        continue;
+      }
+    }
+
+    blocks.sort((a, b) => a.startOffset - b.startOffset);
+    return blocks;
+  }
+
+  // Get the visible text for a range
+  private textForRange(startOffset: number, endOffset: number): string {
+    return this.model.getValueInRange({
+      startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
+      startColumn: 1,
+      endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
+      endColumn: this.lineEndColumnAtOffset(endOffset),
+    });
+  }
+
+  // Build cut tokens for a top-level block: leading comment + pm.test title + body
+  // Build cut tokens for a top-level block: leading comment + name/ids + (pm.test title)
+  private tokensForTopBlock(b: TopBlock): string[] {
+    const base = this.getNameAndLeadingCommentTokens(b.node); // names + leading comment + sampled body ids
+    let titleTokens: string[] = [];
+
+    if (b.kind === "pm_test") {
+      const args = b.node.childForFieldName("arguments");
+      const a0 = args?.namedChildren?.[0];
+      if (a0 && (a0.type === "string" || a0.type === "template_string")) {
+        const title = a0.text.replace(/^['"`]/, "").replace(/['"`]$/, "");
+        titleTokens = cutTokenize(title);
+      }
+    }
+
+    // de-dupe while preserving order
+    const seen = new Set<string>();
+    const all = [...base, ...titleTokens];
+    const out: string[] = [];
+    for (const t of all)
+      if (!seen.has(t)) {
+        seen.add(t);
+        out.push(t);
+      }
+    return out;
+  }
+
+  // Tokens around the current edit: nearest function (with leading comment) else current line + its comment
+  private tokensForCurrentEdit(cursor: Position): {
+    tokens: string[];
+    range: { startOffset: number; endOffset: number };
+  } {
+    if (!this.tree)
+      return { tokens: [], range: { startOffset: 0, endOffset: 0 } };
+
+    const pos: Point = {
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    };
+    const nodeAt = this.tree.rootNode.descendantForPosition(pos);
+
+    const isFn = (n: Node | null) =>
+      !!n &&
+      (n.type === "function_declaration" ||
+        n.type === "function_expression" ||
+        n.type === "arrow_function" ||
+        n.type === "method_definition" ||
+        n.type === "function");
+
+    let fn: Node | null = nodeAt;
+    while (fn && !isFn(fn)) fn = fn.parent;
+
+    if (fn) {
+      const { startOffset, endOffset } =
+        this.expandNodeToFullLinesWithLeadingComments(fn);
+      const cmt = this.leadingCommentTextAt(fn.startPosition.row + 1);
+      const body = this.textForRange(startOffset, endOffset);
+      return {
+        tokens: cutTokenize([cmt, body].join(" \n ")),
+        range: { startOffset, endOffset },
+      };
+    }
+
+    const lineText = this.getLineText(cursor.lineNumber);
+    const cmt = this.leadingCommentTextAt(cursor.lineNumber);
+    const startOffset = this.model.getOffsetAt({
+      lineNumber: cursor.lineNumber,
+      column: 1,
+    });
+    const endOffset = this.model.getOffsetAt({
+      lineNumber: cursor.lineNumber,
+      column: this.lineEndColumn(cursor.lineNumber),
+    });
+    return {
+      tokens: cutTokenize([cmt, lineText].join(" \n ")),
+      range: { startOffset, endOffset },
+    };
+  }
+
+  // Rank *all* other top-level blocks by Jaccard to current edit; return top K (no overlap with current)
+  // Return ALL scored blocks; let caller filter and slice
+  private rankSimilarTopBlocks(
+    cursor: Position
+  ): Array<{ block: TopBlock; score: number }> {
+    const all = this.collectTopLevelBlocks();
+    const { tokens: qTokens, range: qRange } =
+      this.tokensForCurrentEdit(cursor);
+    const qSet = new Set(qTokens);
+
+    const scored = all
+      .filter(
+        (b) =>
+          b.endOffset <= qRange.startOffset || b.startOffset >= qRange.endOffset
+      )
+      .map((b) => {
+        const tks = this.tokensForTopBlock(b);
+        const score = jaccard(qSet, new Set(tks));
+        return { block: b, score };
+      });
+
+    // Prefer higher similarity, then closer to cursor
+    const lineAt = (off: number) => this.model.getPositionAt(off).lineNumber;
+    scored.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const da = Math.abs(lineAt(a.block.startOffset) - cursor.lineNumber);
+      const db = Math.abs(lineAt(b.block.startOffset) - cursor.lineNumber);
+      return da - db;
+    });
+
+    return scored;
+  }
+
+  private keyOf(r: { startOffset: number; endOffset: number }) {
+    return `${r.startOffset}:${r.endOffset}`;
+  }
+  private overlaps(
+    a: { startOffset: number; endOffset: number },
+    b: { startOffset: number; endOffset: number }
+  ) {
+    return !(a.endOffset <= b.startOffset || a.startOffset >= b.endOffset);
+  }
+  private filterNonOverlapping<
+    T extends { startOffset: number; endOffset: number }
+  >(items: T[], taken: Array<{ startOffset: number; endOffset: number }>) {
+    return items.filter((it) => !taken.some((t) => this.overlaps(it, t)));
+  }
+
+  private classRangeTaken: Array<{ startOffset: number; endOffset: number }> =
+    [];
+
+  private reserveRanges(
+    ranges: Array<{ startOffset: number; endOffset: number }>
+  ) {
+    for (const r of ranges)
+      this.classRangeTaken.push({
+        startOffset: r.startOffset,
+        endOffset: r.endOffset,
+      });
+  }
+
+  private resetRangeReservations() {
+    this.classRangeTaken = [];
+  }
+
   public getRankedContextSections(
     cursor: Position,
     opts: RankedSectionsOptions = {}
   ): ExtractRankedContextSections {
+    this.resetRangeReservations();
+
     const totalBudget = Math.max(1000, opts.maxCharsBudget ?? 8000);
     const percents = opts.tierPercents ?? DEFAULT_TIER_PERCENTS;
     const budgets = this.deriveBudgets(totalBudget, percents);
+
     const debug: DebugInfo = {
       titleTokens: [],
       queryTokens: [],
@@ -1485,7 +1697,7 @@ export class ContextExtractor {
       depsAdded: [],
     };
 
-    // ---- Tier A (local/test near cursor) ----
+    // ---- Tier A (always exactly one slice) ----
     const tierA = this.getContextAroundCursor(cursor, {
       ...opts,
       maxCharsBudget: budgets.A,
@@ -1495,8 +1707,9 @@ export class ContextExtractor {
       endOffset: tierA.endOffset,
     };
     const linesAroundCursorRanges = [baseRange];
+    this.reserveRanges(linesAroundCursorRanges); // reserve A
 
-    // Title tokens for A if it's a pm.test(...)
+    // Title / query tokens
     const nodeAtCursor = this.tree!.rootNode.descendantForPosition({
       row: cursor.lineNumber - 1,
       column: cursor.column - 1,
@@ -1505,22 +1718,16 @@ export class ContextExtractor {
     const aContainer = aFunc ? this.wrapFunctionIfArgument(aFunc) : null;
     const title = aContainer ? this.getTestTitleFromNode(aContainer) : null;
     const titleTokens = this.tokenize(title);
-    debug.titleTokens = titleTokens;
-
     const queryTokens = this.buildQueryTokens(cursor);
     debug.titleTokens = titleTokens;
-    debug.queryTokens = queryTokens; // or extend DebugInfo with queryTokens: string[]
+    debug.queryTokens = queryTokens;
 
-    // ---- Build global index for dependency expansion
+    // Globals index (for later dep-closure)
     const globalIndex = this.buildGlobalIndex();
 
-    // ---- Tier B: Declarations (const/let/var only; exclude overlap with A)
+    // ---- Tier B: Declarations (NO overlap with A) ----
     const declOnly = this.collectGlobalBlockCandidates()
-      .filter(
-        (b) =>
-          b.node.type === "lexical_declaration" ||
-          b.node.type === "variable_declaration"
-      )
+      .filter((b) => b.kind === "declaration")
       .filter(
         (b) =>
           b.endOffset <= baseRange.startOffset ||
@@ -1532,77 +1739,62 @@ export class ContextExtractor {
       { ...baseRange, text: tierA.text },
       cursor,
       budgets.B,
-      /* we can pass queryTokens or titleTokens; B is mostly dependency/KIND-driven */
       titleTokens
     );
     debug.scored.B = rankedB;
+
+    // ensure disjointness w/ A (already filtered) and within budget
     const pickedB = this.selectWithinBudget(
-      rankedB.filter((b) => b.endOffset - b.startOffset <= budgets.B),
+      this.filterNonOverlapping(rankedB, this.classRangeTaken),
       budgets.B
     );
     debug.picked.B = pickedB;
-    // mark skipped
-    const pickedBSet = new Set(pickedB);
+    const pickedBKeys = new Set(pickedB.map((b) => this.keyOf(b)));
     for (const r of rankedB)
-      if (!pickedBSet.has(r))
+      if (!pickedBKeys.has(this.keyOf(r)))
         debug.skipped.B.push({ block: r, reason: "over_budget" });
+    this.reserveRanges(pickedB); // reserve B
 
-    // ---- Tier C: Relevant helpers (cut-token similarity)
-    const helperCands = this.collectHelperFunctionCandidates(baseRange);
-    type ScoredCand = RankedBlock & { sim: number };
-    const scoredHelpers: ScoredCand[] = helperCands
-      .map((br) => {
-        const sim = this.scoreHelperSimilarity(queryTokens, br.node);
-        // reuse RankedBlock shape lightly (signals not needed here)
-        return {
-          ...br,
-          sizeChars: br.endOffset - br.startOffset,
-          signals: { lexical: 0, reference: 0, kind: 0, complexity: 0 },
-          score: sim,
-          sim,
-        };
-      })
-      .sort((a, b) => b.sim - a.sim || a.sizeChars - b.sizeChars);
-
-    // low-latency: take top K small ones while staying in C budget
+    // ---- Tier C: Relevant helpers (cut-token similarity) ----
     const TOP_K = 3;
-    const filteredByCap = scoredHelpers
-      .filter((h) => h.endOffset - h.startOffset <= budgets.C)
-      .slice(0, 12); // tiny shortlist to keep selection cheap
 
-    const pickedC = this.selectWithinBudget(filteredByCap, budgets.C).slice(
-      0,
-      TOP_K
-    );
-    debug.scored.C = filteredByCap;
-    debug.picked.C = pickedC;
-    for (const h of filteredByCap)
-      if (!pickedC.includes(h))
-        debug.skipped.C.push({ block: h, reason: "over_budget" });
+    // exclude Tier A range, all non-function declarations, and all pm.tests
+    const testsAll = this.collectOtherTestBlocks();
+    const excludeRanges = [baseRange, ...declOnly, ...testsAll];
 
-    // ---- Tier D: Other tests (exclude A)
-    const testsAll = this.collectOtherTestBlocks(baseRange);
-    const rankedD = this.scoreCandidates(
-      testsAll,
-      { ...baseRange, text: tierA.text },
-      cursor,
-      budgets.D,
-      queryTokens
-    );
-    const pickedD = this.selectWithinBudget(
-      rankedD.filter((b) => b.endOffset - b.startOffset <= budgets.D),
-      budgets.D
-    );
+    const overlapsExcluded = (r: { startOffset: number; endOffset: number }) =>
+      excludeRanges.some(
+        (ex) =>
+          !(r.endOffset <= ex.startOffset || r.startOffset >= ex.endOffset)
+      );
 
-    // ---- One-hop dependency closure for (B + C)
+    // use the full ranked list; keep only helper functions
+    const similarAll = this.rankSimilarTopBlocks(cursor)
+      .filter(
+        (s) =>
+          s.block.kind === "function_declaration" ||
+          s.block.kind === "arrow_function_decl" ||
+          s.block.kind === "function_expression_decl"
+      )
+      .filter((s) => !overlapsExcluded(s.block));
+
+    // now slice to K and enforce budget (never cut)
+    const pickedC = this.selectWithinBudget(
+      similarAll.map((s) => s.block),
+      budgets.C
+    ).slice(0, TOP_K);
+
+    this.reserveRanges(pickedC); // reserve C
+
+    // ---- One-hop dependency closure only for B + C (never re-add A or duplicates) ----
     const rangesBC = [
       ...pickedB.map((b) => ({
         startOffset: b.startOffset,
         endOffset: b.endOffset,
       })),
-      ...pickedC.map((b) => ({
-        startOffset: b.startOffset,
-        endOffset: b.endOffset,
+      ...pickedC.map((c) => ({
+        startOffset: c.startOffset,
+        endOffset: c.endOffset,
       })),
     ];
     const usedBC = rangesBC.reduce(
@@ -1612,61 +1804,54 @@ export class ContextExtractor {
     const bcBudgetLeft = Math.max(0, budgets.B + budgets.C - usedBC);
 
     const depExpanded = this.expandWithDependencies(
-      [...pickedB, ...pickedC],
+      [
+        ...pickedB.map((b) => b as BlockRange),
+        ...pickedC.map(
+          (c) => ({ ...c, node: c.node } as unknown as BlockRange)
+        ),
+      ],
       globalIndex,
       rangesBC,
       bcBudgetLeft
-    );
+    )
+      // ensure we never add A or overlap with picked B/C
+      .filter((r) => !this.overlaps(r, baseRange))
+      .filter(
+        (r) =>
+          this.filterNonOverlapping([r], [...pickedB, ...pickedC]).length > 0
+      );
 
-    // Record which deps were added (best-effort by matching to globalIndex blocks)
-    const depKeys = new Set(
-      depExpanded.map((r) => `${r.startOffset}:${r.endOffset}`)
-    );
-    for (const [name, br] of globalIndex.entries()) {
-      const key = `${br.startOffset}:${br.endOffset}`;
-      if (
-        depKeys.has(key) &&
-        !rangesBC.some(
-          (r) =>
-            r.startOffset === br.startOffset && r.endOffset === br.endOffset
-        )
-      ) {
-        debug.depsAdded.push({
-          name,
-          startOffset: br.startOffset,
-          endOffset: br.endOffset,
-        });
-      }
-    }
+    // ---- Tier D: Existing tests as skeletons (disjoint by *kind* from C) ----
+    // Because we filtered pm_test out of C, all tests live here as skeletons, excluding Tier A.
+    const testsExA = this.collectOtherTestBlocks(baseRange);
+    const existingTests = testsExA.length
+      ? testsExA.map((t) => this.renderTestSkeleton(t.node)).join("\n")
+      : "";
 
-    // ---- Partition into sections (strings; non-merged, budget-respecting)
-    // A: linesAroundCursor
+    // ---- Build final strings ----
     const linesAroundCursor = this.textFromRanges(linesAroundCursorRanges);
 
-    // B: declarations (picked globals + dependency additions that are globals)
-    const declRanges = depExpanded.filter((r) =>
-      declOnly.some(
-        (g) => g.startOffset === r.startOffset && g.endOffset === r.endOffset
-      )
-    );
+    // Declarations = pickedB + any dep-expanded that are declarations
+    const declRanges = [
+      ...pickedB.map((b) => ({
+        startOffset: b.startOffset,
+        endOffset: b.endOffset,
+      })),
+      ...depExpanded.filter((r) =>
+        declOnly.some(
+          (g) => g.startOffset === r.startOffset && g.endOffset === r.endOffset
+        )
+      ),
+    ];
     const declarations = this.textFromRanges(declRanges);
 
-    // C: relevantLines (non-global small helpers that slipped in; in this version, we keep empty)
-    const relevantRanges = pickedC.map((b) => ({
-      startOffset: b.startOffset,
-      endOffset: b.endOffset,
+    const relevantRanges = pickedC.map((r) => ({
+      startOffset: r.startOffset,
+      endOffset: r.endOffset,
     }));
     const relevantLines = this.textFromRanges(relevantRanges);
 
-    // D: existingTests (pickedC as full blocks OR skeletons if nothing fit)
-    const existingTests = pickedD.length
-      ? this.textFromRanges(pickedD)
-      : rankedD
-          .slice(0, 2)
-          .map((r) => this.renderTestSkeleton(r.node))
-          .join("\n");
-
-    // ---- Meta & debug
+    // ---- Emit ----
     const res: ExtractRankedContextSections = {
       linesAroundCursor,
       declarations,
@@ -1679,17 +1864,14 @@ export class ContextExtractor {
           A: linesAroundCursorRanges,
           B: declRanges,
           C: relevantRanges,
-          D: pickedD.map((b) => ({
-            startOffset: b.startOffset,
-            endOffset: b.endOffset,
-          })),
+          D: [], // skeletons are synthetic
         },
         pickedCounts: {
           A: 1,
           B: declRanges.length,
           C: relevantRanges.length,
-          D: pickedD.length,
-          skeletons: pickedD.length ? 0 : Math.min(2, rankedD.length),
+          D: testsExA.length,
+          skeletons: testsExA.length,
         },
         titleTokens,
       },
