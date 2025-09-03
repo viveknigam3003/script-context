@@ -391,58 +391,6 @@ function splitCamelSnake(s: string): string[] {
 }
 
 /**
- * Tokenizes text into meaningful words, filters stopwords, and removes duplicates.
- *
- * This is the core tokenization function used throughout the context extraction process.
- * It's designed specifically for code analysis, handling programming constructs intelligently.
- *
- * Process:
- * 1. Converts to lowercase for case-insensitive matching
- * 2. Splits camelCase and snake_case using splitCamelSnake()
- * 3. Filters out single-character tokens (usually operators/punctuation)
- * 4. Removes common code stopwords (if, for, const, etc.)
- * 5. Deduplicates while preserving order
- *
- * @param raw Raw text to tokenize (code, comments, identifiers)
- * @param STOP Set of stopwords to filter out (defaults to CODE_STOPWORDS)
- * @returns Array of meaningful, deduplicated tokens
- *
- * @example
- * ```typescript
- * cutTokenize("const userName = pm.response.json().userName")
- * // Returns: ["user", "name", "pm", "response", "json"]
- *
- * cutTokenize("pm.test('Check for response body schema', function() {")
- * // Returns: ["pm", "test", "check", "response", "body", "schema", "function"]
- * ```
- */
-function cutTokenize(
-  raw: string,
-  STOP: Set<string> = CODE_STOPWORDS
-): string[] {
-  if (!raw) return [];
-
-  const out: string[] = [];
-  // Process each word through camelCase/snake_case splitting
-  for (const w of splitCamelSnake(raw.toLowerCase())) {
-    if (w.length <= 1) continue; // Skip single characters (operators, etc.)
-    if (STOP.has(w)) continue; // Skip common code keywords
-    out.push(w);
-  }
-
-  // Deduplicate while preserving order for consistent results
-  const seen = new Set<string>();
-  const dedup: string[] = [];
-  for (const t of out) {
-    if (!seen.has(t)) {
-      seen.add(t);
-      dedup.push(t);
-    }
-  }
-  return dedup;
-}
-
-/**
  * Calculates Jaccard similarity coefficient between two sets of tokens.
  *
  * Jaccard similarity is the size of intersection divided by the size of union.
@@ -618,7 +566,6 @@ export class ContextExtractor {
    */
   forceBuildTree() {
     this.ensureIncrementalParseUpToDate();
-    console.log("Tree rebuilt successfully\n", this.tree);
   }
 
   /**
@@ -758,234 +705,6 @@ export class ContextExtractor {
       p = p.parent;
     }
     return funcNode;
-  }
-
-  /**
-   * Merges overlapping and adjacent ranges into a sorted, non-overlapping list.
-   * This is essential for creating contiguous text blocks from multiple AST nodes.
-   *
-   * @param ranges Array of ranges with start and end offsets
-   * @returns Merged and sorted array of non-overlapping ranges
-   */
-  private mergeRanges(
-    ranges: Array<{ startOffset: number; endOffset: number }>
-  ) {
-    const sorted = ranges.slice().sort((a, b) => a.startOffset - b.startOffset);
-    const out: typeof sorted = [];
-    for (const r of sorted) {
-      const last = out[out.length - 1];
-      if (!last || r.startOffset >= last.endOffset) {
-        out.push({ ...r });
-      } else {
-        last.endOffset = Math.max(last.endOffset, r.endOffset);
-      }
-    }
-    return out;
-  }
-
-  /**
-   * Checks if a node or any of its ancestors have parse errors or missing nodes.
-   * This helps detect unfinished or syntactically incorrect code that needs special handling.
-   *
-   * @param n Node to check (will traverse up the parent chain)
-   * @returns True if any node in the ancestor chain has errors
-   */
-  private nodeOrAncestorsHaveError(n: Node | null): boolean {
-    let p: Node | null = n;
-    // web-tree-sitter nodes support hasError() and isMissing
-    while (p) {
-      if (p.hasError || p.isMissing) return true;
-      p = p.parent;
-    }
-    return this.tree?.rootNode?.hasError ?? false;
-  }
-
-  /**
-   * Uses lightweight text heuristics to detect likely unfinished code near the cursor.
-   * Checks for unbalanced parentheses/braces, incomplete declarations, and common unfinished patterns.
-   * This is much faster than deep AST analysis and catches most common cases.
-   *
-   * @param cursor Current cursor position
-   * @returns True if code appears unfinished or incomplete
-   */
-  private isLikelyUnfinishedNearCursor(cursor: Position): boolean {
-    const total = this.model.getLineCount();
-    const from = Math.max(1, cursor.lineNumber - 2);
-    const to = Math.min(total, cursor.lineNumber + 30); // small forward lookahead
-
-    const text = this.model.getValueInRange({
-      startLineNumber: from,
-      startColumn: 1,
-      endLineNumber: to,
-      endColumn: this.lineEndColumn(to),
-    });
-
-    // Count braces/parens (very lightweight; good enough for "unfinished")
-    let paren = 0,
-      brace = 0;
-    for (const ch of text) {
-      if (ch === "(") paren++;
-      else if (ch === ")") paren = Math.max(0, paren - 1);
-      else if (ch === "{") brace++;
-      else if (ch === "}") brace = Math.max(0, brace - 1);
-    }
-
-    // Check current line for incomplete declarations
-    const currentLine = this.model.getLineContent(cursor.lineNumber).trim();
-    const hasIncompleteDeclaration =
-      /^(const|let|var)\s*$/.test(currentLine) || // Just "const ", "let ", "var "
-      /^(const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(currentLine) || // "const identifier"
-      /^function\s*$/.test(currentLine) || // Just "function "
-      /^function\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(currentLine); // "function name"
-
-    // Extra hint: line looks like a starting construct w/o closure nearby
-    const startsCallOrFn = /\b(pm\.test\s*\(|function\b|=>\s*\{?$)/.test(
-      currentLine
-    );
-
-    return paren > 0 || brace > 0 || hasIncompleteDeclaration || startsCallOrFn;
-  }
-
-  /**
-   * Extracts raw, contiguous full lines around the cursor without AST analysis.
-   * This is the ultimate fallback when AST parsing fails or produces unreliable results.
-   * Always returns complete lines (never cuts mid-line) to maintain syntax validity.
-   *
-   * @param cursor Current cursor position
-   * @param beforeLines Number of lines to include before cursor
-   * @param afterLines Number of lines to include after cursor
-   * @returns Context result with raw text lines
-   */
-  private rawLinesAround(
-    cursor: Position,
-    beforeLines: number,
-    afterLines: number
-  ): ExtractContextResult {
-    const total = this.model.getLineCount();
-    const startLine = Math.max(1, cursor.lineNumber - beforeLines);
-    const endLine = Math.min(total, cursor.lineNumber + afterLines);
-
-    const startOffset = this.model.getOffsetAt({
-      lineNumber: startLine,
-      column: 1,
-    });
-    const endOffset = this.model.getOffsetAt({
-      lineNumber: endLine,
-      column: this.lineEndColumn(endLine),
-    });
-
-    const text = this.model.getValueInRange({
-      startLineNumber: startLine,
-      startColumn: 1,
-      endLineNumber: endLine,
-      endColumn: this.lineEndColumn(endLine),
-    });
-
-    return { text, startOffset, endOffset, strategy: "fallback-lines" };
-  }
-
-  /**
-   * Hybrid extraction strategy for unfinished/incomplete code.
-   * Combines AST-based block detection with raw line extraction for current function.
-   *
-   * Strategy:
-   * 1. Find the current incomplete function/block using AST
-   * 2. Include the complete current block up to cursor (raw to preserve unfinished syntax)
-   * 3. Add complete neighboring blocks as context
-   * 4. Merge all ranges and return contiguous text
-   *
-   * This ensures we get meaningful context even for broken/incomplete code.
-   *
-   * @param cursor Current cursor position
-   * @param beforeLines Fallback lines before cursor if no AST context
-   * @param afterLines Fallback lines after cursor if no AST context
-   * @returns Context result with hybrid extraction
-   */
-  private hybridUnfinishedAround(
-    cursor: Position,
-    beforeLines: number,
-    afterLines: number
-  ): ExtractContextResult {
-    const total = this.model.getLineCount();
-    const startLine = Math.max(1, cursor.lineNumber - beforeLines);
-    const endLine = Math.min(total, cursor.lineNumber + afterLines);
-
-    const tsPos: Point = {
-      row: cursor.lineNumber - 1,
-      column: cursor.column - 1,
-    };
-    const nodeAt = this.tree?.rootNode.descendantForPosition(tsPos) ?? null;
-
-    // Find the unfinished container (prefer function-like wrapped in call_expression)
-    let container: Node | null = null;
-    if (nodeAt) {
-      let cur: Node | null = nodeAt;
-      while (cur) {
-        if (this.isFunctionLike(cur)) {
-          container = this.wrapFunctionIfArgument(cur);
-          break;
-        }
-        if (this.isWholeBlockCandidate(cur)) {
-          container = this.wholeBlockContainer(cur);
-          break;
-        }
-        cur = cur.parent;
-      }
-    }
-    if (!container) {
-      // Fallback: raw window
-      return this.rawLinesAround(cursor, beforeLines, afterLines);
-    }
-
-    // Raw range for the unfinished container: from its real start (with leading comments) to cursor line end
-    const unfinishedStart =
-      this.expandNodeToFullLinesWithLeadingComments(container).startOffset;
-    const unfinishedEnd = this.model.getOffsetAt({
-      lineNumber: cursor.lineNumber,
-      column: this.lineEndColumn(cursor.lineNumber),
-    });
-    const unfinishedRange = {
-      startOffset: unfinishedStart,
-      endOffset: unfinishedEnd,
-    };
-
-    // Top-level neighbors: always include prev/next whole blocks (no line-window restriction)
-    const top = this.topLevelAncestor(container) ?? container;
-    const prevTop = this.previousNamedSibling(top);
-    const nextTop = this.nextNamedSibling(top);
-
-    const neighborRanges: Array<{ startOffset: number; endOffset: number }> =
-      [];
-    const pushWhole = (n: Node | null) => {
-      if (!n) return;
-      const r = this.expandNodeToFullLinesWithLeadingComments(n);
-      neighborRanges.push(r);
-    };
-    pushWhole(prevTop);
-    pushWhole(nextTop);
-
-    // Also include any full blocks that intersect the raw window (optional, won’t slice)
-    const windowBlocks = this.collectWholeBlocksIntersectingWindow(
-      startLine,
-      endLine
-    ).map((b) => ({ startOffset: b.startOffset, endOffset: b.endOffset }));
-
-    // Build final ranges: unfinished current block + neighbors + window blocks
-    const ranges = [unfinishedRange, ...neighborRanges, ...windowBlocks];
-
-    // Merge adjacent/overlapping and produce final text
-    const merged = this.mergeRanges(ranges);
-    const startOffset = merged[0].startOffset;
-    const endOffset = merged[merged.length - 1].endOffset;
-
-    const text = this.model.getValueInRange({
-      startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
-      startColumn: 1,
-      endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-      endColumn: this.lineEndColumnAtOffset(endOffset),
-    });
-
-    return { text, startOffset, endOffset, strategy: "fallback-lines" };
   }
 
   /**
@@ -1938,60 +1657,7 @@ export class ContextExtractor {
     return n;
   }
 
-  /**
-   * Collects complete block nodes that intersect with a given line window.
-   * Only returns full nodes - never slices blocks at window boundaries.
-   * This preserves syntactic integrity of code blocks.
-   *
-   * @param startLine Starting line number of the window (1-based)
-   * @param endLine Ending line number of the window (1-based)
-   * @returns Array of block ranges with their AST nodes
-   */
-  private collectWholeBlocksIntersectingWindow(
-    startLine: number,
-    endLine: number
-  ): Array<{ startOffset: number; endOffset: number; node: Node }> {
-    if (!this.tree) return [];
-    const root = this.tree.rootNode;
-
-    // Gather direct children (top-level statements) that intersect the window
-    const results: Array<{
-      startOffset: number;
-      endOffset: number;
-      node: Node;
-    }> = [];
-
-    for (let i = 0; i < root.namedChildCount; i++) {
-      const child = root.namedChild(i)!;
-      if (!this.isWholeBlockCandidate(child)) continue;
-
-      const s = child.startPosition.row + 1;
-      const e = child.endPosition.row + 1;
-
-      // Intersect line window?
-      if (e < startLine || s > endLine) continue;
-
-      const container = this.wholeBlockContainer(child);
-      const { startOffset, endOffset } =
-        this.expandNodeToFullLinesWithLeadingComments(container); // 👈
-      results.push({ startOffset, endOffset, node: container });
-    }
-
-    return results.sort((a, b) => a.startOffset - b.startOffset);
-  }
-
   // ===== PRIVATE UTILITY METHODS =====
-
-  /**
-   * Determines if a node represents a function body.
-   * Function bodies are the block containers for function code.
-   *
-   * @param n Node to check
-   * @returns True if node is a function body block
-   */
-  private isFunctionBody(n: Node | null): boolean {
-    return !!n && (n.type === "statement_block" || n.type === "function_body");
-  }
 
   /**
    * Determines if the cursor is at the top level (not inside any block/function).
@@ -2261,34 +1927,6 @@ export class ContextExtractor {
     return adjustedEnd;
   }
 
-  /**
-   * Finds the nearest enclosing function from a given node.
-   * Traverses up the AST tree looking for function-like constructs or function bodies.
-   * Also searches within argument lists for function expressions.
-   *
-   * @param node Starting node to search from
-   * @returns Nearest function node or null if none found
-   */
-  private nearestFunctionFrom(node: Node): Node | null {
-    let cur: Node | null = node;
-    while (cur) {
-      if (this.isFunctionLike(cur)) return cur;
-      if (
-        this.isFunctionBody(cur) &&
-        cur.parent &&
-        this.isFunctionLike(cur.parent)
-      ) {
-        return cur.parent;
-      }
-      if (cur.type === "arguments") {
-        const fnArg = cur.namedChildren.find((c) => this.isFunctionLike(c));
-        if (fnArg) return fnArg;
-      }
-      cur = cur.parent;
-    }
-    return null;
-  }
-
   /** Return the highest ancestor that is a direct child of the root (i.e., a top-level statement) */
   private topLevelAncestor(node: Node): Node | null {
     let cur: Node | null = node;
@@ -2299,32 +1937,6 @@ export class ContextExtractor {
     }
     // If last is directly under root, it's top-level
     return last && last.parent === this.tree?.rootNode ? last : null;
-  }
-
-  /**
-   * Gets the previous named sibling node, skipping any missing/error nodes.
-   * Missing nodes are placeholder nodes created by the parser for incomplete syntax.
-   *
-   * @param node Node to find the previous sibling for
-   * @returns Previous named sibling or null if none exists
-   */
-  private previousNamedSibling(node: Node): Node | null {
-    let prev = node.previousNamedSibling;
-    while (prev && prev.isMissing) prev = prev.previousNamedSibling;
-    return prev ?? null;
-  }
-
-  /**
-   * Gets the next named sibling node, skipping any missing/error nodes.
-   * Missing nodes are placeholder nodes created by the parser for incomplete syntax.
-   *
-   * @param node Node to find the next sibling for
-   * @returns Next named sibling or null if none exists
-   */
-  private nextNamedSibling(node: Node): Node | null {
-    let next = node.nextNamedSibling;
-    while (next && next.isMissing) next = next.nextNamedSibling;
-    return next ?? null;
   }
 
   /**
@@ -2409,59 +2021,6 @@ export class ContextExtractor {
   private lineEndColumnAtOffset(endOffset: number): number {
     const endPos = this.model.getPositionAt(endOffset);
     return this.lineEndColumn(endPos.lineNumber);
-  }
-
-  /**
-   * Extracts the test title from a pm.test() call expression.
-   * Parses AST node to find the first string argument of pm.test calls.
-   * Handles simple template strings and strips quotes/backticks.
-   *
-   * @param node AST node to analyze (should be call_expression)
-   * @returns Test title string or null if not a valid pm.test call
-   */
-  private getTestTitleFromNode(node: Node): string | null {
-    // pm.test(<title>, <fn>)
-    if (node.type !== "call_expression") return null;
-    const callee = node.child(0);
-    if (!(callee && callee.type === "member_expression")) return null;
-    const obj = callee.child(0);
-    const prop = callee.child(2);
-    const isPmTest =
-      obj?.type === "identifier" && obj.text === "pm" && prop?.text === "test";
-    if (!isPmTest) return null;
-
-    const args = node.childForFieldName("arguments");
-    if (!args || args.namedChildCount === 0) return null;
-    const a0 = args.namedChildren[0];
-    if (!a0) return null;
-
-    if (a0.type === "string" || a0.type === "template_string") {
-      return (
-        a0.text
-          // strip quotes/backticks and simple interpolations
-          ?.replace(/^['"`]/, "")
-          ?.replace(/['"`]$/, "")
-          ?.replace(/\$\{[^}]+\}/g, "") ?? null
-      );
-    }
-    return null;
-  }
-
-  /**
-   * Tokenizes a string into lowercase alphanumeric tokens for similarity analysis.
-   * Removes special characters and splits on whitespace. Used for fuzzy matching
-   * and semantic similarity scoring between code sections.
-   *
-   * @param s String to tokenize
-   * @returns Array of lowercase alphanumeric tokens
-   */
-  private tokenize(s: string | null | undefined): string[] {
-    if (!s) return [];
-    return s
-      .toLowerCase()
-      .replace(/[^a-z0-9_]+/g, " ")
-      .split(/\s+/)
-      .filter(Boolean);
   }
 
   /**
@@ -2643,66 +2202,6 @@ export class ContextExtractor {
       );
     }
     return parts.join("\n");
-  }
-
-  private getLineText(lineNumber: number): string {
-    return this.model.getLineContent(
-      Math.max(1, Math.min(lineNumber, this.model.getLineCount()))
-    );
-  }
-
-  // Pull contiguous single-line comments immediately above a node/line
-  private leadingCommentTextAt(lineNumber: number): string {
-    let startLine = Math.max(1, lineNumber - 1);
-    while (startLine > 0) {
-      const txt = this.model.getLineContent(startLine);
-      if (/^\s*\/\/.*/.test(txt) || /^\s*$/.test(txt)) {
-        startLine--;
-        continue;
-      }
-      break;
-    }
-    const from = startLine + 1,
-      to = Math.max(1, lineNumber - 1);
-    const parts: string[] = [];
-    for (let ln = from; ln <= to; ln++) {
-      const t = this.model.getLineContent(ln).replace(/^\s*\/\/\s?/, "");
-      if (t.trim().length) parts.push(t);
-    }
-    return parts.join(" ");
-  }
-
-  /**
-   * Finds the test title from a pm.test() call near the cursor position.
-   * Traverses up the AST to find the nearest function and checks if it's wrapped in a pm.test call.
-   *
-   * @param cursor Current cursor position
-   * @returns Test title string or null if no pm.test call found
-   */
-  private getTestTitleNearCursor(cursor: Position): string | null {
-    if (!this.tree) return null;
-    const nodeAt = this.tree.rootNode.descendantForPosition({
-      row: cursor.lineNumber - 1,
-      column: cursor.column - 1,
-    });
-    const fn = nodeAt ? this.nearestFunctionFrom(nodeAt) : null;
-    const call = fn ? this.wrapFunctionIfArgument(fn) : null;
-    return call ? this.getTestTitleFromNode(call) : null;
-  }
-
-  /**
-   * Builds query tokens for similarity search from context around cursor.
-   * Combines tokens from current line text, leading comments, and test titles.
-   * These tokens are used for semantic matching with other code sections.
-   *
-   * @param cursor Current cursor position
-   * @returns Array of tokenized strings for similarity analysis
-   */
-  private buildQueryTokens(cursor: Position): string[] {
-    const line = this.getLineText(cursor.lineNumber);
-    const cmt = this.leadingCommentTextAt(cursor.lineNumber);
-    const title = this.getTestTitleNearCursor(cursor) ?? "";
-    return [...cutTokenize(line), ...cutTokenize(cmt), ...cutTokenize(title)];
   }
 
   /**
