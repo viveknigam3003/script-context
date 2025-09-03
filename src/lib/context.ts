@@ -1778,47 +1778,28 @@ export class ContextExtractor {
     adjustedStart = this.adjustStartForIncompleteDeclarations(adjustedStart);
     adjustedEnd = this.adjustEndForIncompleteDeclarations(adjustedEnd);
 
-    // Check if startLine cuts into a block
-    const startPos: Point = { row: adjustedStart - 1, column: 0 };
-    const startNode = this.tree.rootNode.descendantForPosition(startPos);
+    // Get all top-level blocks to avoid cutting them
+    const topLevelBlocks = this.getTopLevelBlocks();
 
-    if (startNode) {
-      // Find if we're cutting into a block
-      let current: Node | null = startNode;
-      while (current && current !== this.tree.rootNode) {
-        if (this.isWholeBlockCandidate(current)) {
-          const blockStartLine = current.startPosition.row + 1;
-          const blockEndLine = current.endPosition.row + 1;
+    // Adjust start line to avoid cutting blocks
+    for (const block of topLevelBlocks) {
+      const blockStartLine = block.startLine;
+      const blockEndLine = block.endLine;
 
-          // If our start line is in the middle of this block, include the whole block
-          if (adjustedStart > blockStartLine && adjustedStart <= blockEndLine) {
-            adjustedStart = blockStartLine;
-            break;
-          }
-        }
-        current = current.parent;
+      // If our start line cuts into this block, include the whole block
+      if (adjustedStart > blockStartLine && adjustedStart <= blockEndLine) {
+        adjustedStart = blockStartLine;
       }
     }
 
-    // Check if endLine cuts into a block
-    const endPos: Point = { row: adjustedEnd - 1, column: 0 };
-    const endNode = this.tree.rootNode.descendantForPosition(endPos);
+    // Adjust end line to avoid cutting blocks
+    for (const block of topLevelBlocks) {
+      const blockStartLine = block.startLine;
+      const blockEndLine = block.endLine;
 
-    if (endNode) {
-      // Find if we're cutting into a block
-      let current: Node | null = endNode;
-      while (current && current !== this.tree.rootNode) {
-        if (this.isWholeBlockCandidate(current)) {
-          const blockStartLine = current.startPosition.row + 1;
-          const blockEndLine = current.endPosition.row + 1;
-
-          // If our end line is in the middle of this block, include the whole block
-          if (adjustedEnd >= blockStartLine && adjustedEnd < blockEndLine) {
-            adjustedEnd = blockEndLine;
-            break;
-          }
-        }
-        current = current.parent;
+      // If our end line cuts into this block, include the whole block
+      if (adjustedEnd >= blockStartLine && adjustedEnd < blockEndLine) {
+        adjustedEnd = blockEndLine;
       }
     }
 
@@ -1826,6 +1807,42 @@ export class ContextExtractor {
       startLine: Math.max(1, adjustedStart),
       endLine: Math.min(totalLines, adjustedEnd),
     };
+  }
+
+  /**
+   * Gets all top-level blocks in the file with their line ranges.
+   * This helps with syntax sanity by identifying complete blocks that shouldn't be cut.
+   *
+   * @returns Array of top-level blocks with their line ranges
+   */
+  private getTopLevelBlocks(): Array<{
+    startLine: number;
+    endLine: number;
+    node: Node;
+  }> {
+    if (!this.tree) return [];
+
+    const blocks: Array<{
+      startLine: number;
+      endLine: number;
+      node: Node;
+    }> = [];
+
+    const root = this.tree.rootNode;
+    for (let i = 0; i < root.namedChildCount; i++) {
+      const child = root.namedChild(i)!;
+      if (this.isWholeBlockCandidate(child)) {
+        const startLine = child.startPosition.row + 1;
+        const endLine = child.endPosition.row + 1;
+        blocks.push({
+          startLine,
+          endLine,
+          node: child,
+        });
+      }
+    }
+
+    return blocks.sort((a, b) => a.startLine - b.startLine);
   }
 
   /**
