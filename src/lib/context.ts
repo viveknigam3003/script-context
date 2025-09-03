@@ -251,8 +251,6 @@ export interface RankedSectionsOptions extends ContextOptions {
  * Debug information for context extraction analysis
  */
 export type DebugInfo = {
-  titleTokens: string[];
-  queryTokens: string[];
   budgets: { A: number; B: number; C: number; D: number; total: number };
   scored: {
     B: RankedBlock[];
@@ -304,7 +302,6 @@ export interface ExtractRankedContextSections {
       D: number;
       skeletons: number;
     };
-    titleTokens: string[];
   };
   /** Optional debug payload with rankings, signals, and reasons */
   debug?: DebugInfo;
@@ -621,6 +618,7 @@ export class ContextExtractor {
    */
   forceBuildTree() {
     this.ensureIncrementalParseUpToDate();
+    console.log("Tree rebuilt successfully\n", this.tree);
   }
 
   /**
@@ -2657,8 +2655,6 @@ export class ContextExtractor {
 
     // Step 2: Initialize debug information structure for optional debugging
     const debug: DebugInfo = {
-      titleTokens: [],
-      queryTokens: [],
       budgets: { ...budgets, total: totalBudget },
       scored: { B: [], C: [] },
       picked: { B: [], C: [] },
@@ -2693,12 +2689,6 @@ export class ContextExtractor {
     // Step 6: Extract Tier D - Existing tests (10% of budget, currently placeholder)
     // This tier is reserved for future extension with test skeleton extraction
     const existingTests = ""; // Can be extended with test skeleton extraction
-
-    // Step 7: Populate debug information if requested by the user
-    if (opts.debug) {
-      debug.titleTokens = this.extractTitleTokens(cursor);
-      debug.queryTokens = this.buildQueryTokens(cursor);
-    }
 
     // Step 8: Deduplicate overlapping ranges across all tiers
     const rawExtractionResults = {
@@ -2764,8 +2754,6 @@ export class ContextExtractor {
           D: deduplicatedResults.existingTests.offsets.length,
           skeletons: deduplicatedResults.existingTests.offsets.length,
         },
-
-        titleTokens: debug.titleTokens,
       },
 
       // Include debug information only if requested
@@ -3081,27 +3069,5 @@ export class ContextExtractor {
   ): boolean {
     // Ranges overlap if one starts before the other ends
     return !(a.endOffset <= b.startOffset || a.startOffset >= b.endOffset);
-  }
-
-  /**
-   * Extracts title tokens from the current editing context for debug information.
-   * Looks for test titles and function names near the cursor position.
-   *
-   * @param cursor Current cursor position
-   * @returns Array of title tokens
-   */
-  private extractTitleTokens(cursor: Position): string[] {
-    if (!this.tree) return [];
-
-    const nodeAtCursor = this.tree.rootNode.descendantForPosition({
-      row: cursor.lineNumber - 1,
-      column: cursor.column - 1,
-    });
-
-    const func = nodeAtCursor ? this.nearestFunctionFrom(nodeAtCursor) : null;
-    const container = func ? this.wrapFunctionIfArgument(func) : null;
-    const title = container ? this.getTestTitleFromNode(container) : null;
-
-    return this.tokenize(title);
   }
 }
