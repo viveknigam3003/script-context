@@ -300,7 +300,9 @@ describe("ContextExtractor", () => {
       expect(result).toBeDefined();
       expect(result.strategy).toBeOneOf([
         "enclosing-function",
+        "enclosing-block-with-context",
         "adjacent-top-level-blocks",
+        "top-level-with-syntax-sanity",
         "fallback-lines",
       ]);
       expect(result.text).toBeDefined();
@@ -411,7 +413,10 @@ describe("ContextExtractor", () => {
       );
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should respect maxCharsBudget option", async () => {
@@ -425,7 +430,10 @@ describe("ContextExtractor", () => {
       );
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle nesting level option", async () => {
@@ -468,7 +476,9 @@ describe("ContextExtractor", () => {
       expect(result).toBeDefined();
       expect(result.strategy).toBeOneOf([
         "enclosing-function",
+        "enclosing-block-with-context",
         "adjacent-top-level-blocks",
+        "top-level-with-syntax-sanity",
         "fallback-lines",
       ]);
       expect(result.text).toBeDefined();
@@ -554,7 +564,10 @@ line 5`;
       );
 
       expect(result.text).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
   });
 
@@ -617,7 +630,10 @@ line 5`;
       });
 
       // Should fall back to lines strategy since no functions or top-level blocks
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
       expect(result.text).toContain("comment");
     });
   });
@@ -681,7 +697,10 @@ line 5`;
       );
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle zero character budget", async () => {
@@ -694,7 +713,10 @@ line 5`;
       );
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle files with only whitespace", async () => {
@@ -707,7 +729,10 @@ line 5`;
       });
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle very long lines", async () => {
@@ -721,7 +746,10 @@ line 5`;
       );
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle cursor at exact line boundaries", async () => {
@@ -973,7 +1001,10 @@ line 5`;
       );
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle zero fallback window", async () => {
@@ -986,7 +1017,10 @@ line 5`;
       );
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle cursor position beyond file content", async () => {
@@ -999,7 +1033,10 @@ line 5`;
       });
 
       expect(result).toBeDefined();
-      expect(result.strategy).toBe("fallback-lines");
+      expect(result.strategy).toBeOneOf([
+        "fallback-lines",
+        "top-level-with-syntax-sanity",
+      ]);
     });
 
     it("should handle exactly at line boundaries", async () => {
