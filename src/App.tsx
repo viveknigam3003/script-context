@@ -43,20 +43,6 @@ function App() {
     }
   }, []);
 
-  // Debounced tree rebuild (500ms delay)
-  const debouncedRebuildTree = useCallback(() => {
-    if (debounceTimeoutRef.current) {
-      clearTimeout(debounceTimeoutRef.current);
-    }
-
-    debounceTimeoutRef.current = window.setTimeout(() => {
-      if (contextExtractor.current) {
-        contextExtractor.current.forceBuildTree();
-        updateTreeStatus();
-      }
-    }, 500);
-  }, [updateTreeStatus]);
-
   // Beautify code function
   const beautifyCode = useCallback(() => {
     if (!inputEditorInstance.current) return;
@@ -201,7 +187,7 @@ pm.test("Check if zip code is valid", function () {
       inputEditorInstance.current?.dispose();
       outputEditorInstance.current?.dispose();
     };
-  }, [updateTreeStatus, debouncedRebuildTree]);
+  }, [updateTreeStatus]);
 
   // const combineSectionsForPreview = (s: ExtractedContext): string => {
   //   return [s.linesAroundCursor].filter(Boolean).join("\n\n");
@@ -302,6 +288,21 @@ pm.test("Check if zip code is valid", function () {
       setIsExtracting(false);
     }
   }, []);
+
+  // Debounced tree rebuild (500ms delay)
+  const debouncedRebuildTree = useCallback(() => {
+    if (debounceTimeoutRef.current) {
+      clearTimeout(debounceTimeoutRef.current);
+    }
+
+    debounceTimeoutRef.current = window.setTimeout(() => {
+      if (contextExtractor.current) {
+        contextExtractor.current.forceBuildTree();
+        updateTreeStatus();
+        extractScript();
+      }
+    }, 500);
+  }, [updateTreeStatus, extractScript]);
 
   return (
     <div className="app">

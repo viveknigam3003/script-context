@@ -802,7 +802,7 @@ export class ContextExtractor {
 
   /**
    * Uses lightweight text heuristics to detect likely unfinished code near the cursor.
-   * Checks for unbalanced parentheses/braces and common unfinished patterns.
+   * Checks for unbalanced parentheses/braces, incomplete declarations, and common unfinished patterns.
    * This is much faster than deep AST analysis and catches most common cases.
    *
    * @param cursor Current cursor position
@@ -820,7 +820,7 @@ export class ContextExtractor {
       endColumn: this.lineEndColumn(to),
     });
 
-    // Count braces/parens (very lightweight; good enough for “unfinished”)
+    // Count braces/parens (very lightweight; good enough for "unfinished")
     let paren = 0,
       brace = 0;
     for (const ch of text) {
@@ -830,11 +830,20 @@ export class ContextExtractor {
       else if (ch === "}") brace = Math.max(0, brace - 1);
     }
 
-    // Extra hint: line looks like a starting construct w/o closure nearby
-    const near = this.model.getLineContent(cursor.lineNumber);
-    const startsCallOrFn = /\b(pm\.test\s*\(|function\b|=>\s*\{?$)/.test(near);
+    // Check current line for incomplete declarations
+    const currentLine = this.model.getLineContent(cursor.lineNumber).trim();
+    const hasIncompleteDeclaration =
+      /^(const|let|var)\s*$/.test(currentLine) || // Just "const ", "let ", "var "
+      /^(const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(currentLine) || // "const identifier"
+      /^function\s*$/.test(currentLine) || // Just "function "
+      /^function\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(currentLine); // "function name"
 
-    return paren > 0 || brace > 0 || startsCallOrFn;
+    // Extra hint: line looks like a starting construct w/o closure nearby
+    const startsCallOrFn = /\b(pm\.test\s*\(|function\b|=>\s*\{?$)/.test(
+      currentLine
+    );
+
+    return paren > 0 || brace > 0 || hasIncompleteDeclaration || startsCallOrFn;
   }
 
   /**
@@ -2081,6 +2090,7 @@ export class ContextExtractor {
   /**
    * Expands prefix/suffix lines while maintaining syntax sanity.
    * If the expansion would cut into the middle of a block, includes the entire block.
+   * Also handles incomplete/unfinished declarations properly.
    *
    * @param startLine Starting line for expansion (1-based)
    * @param endLine Ending line for expansion (1-based)
@@ -2097,6 +2107,10 @@ export class ContextExtractor {
     const totalLines = this.model.getLineCount();
     let adjustedStart = Math.max(1, startLine);
     let adjustedEnd = Math.min(totalLines, endLine);
+
+    // Check for incomplete declarations at the boundaries
+    adjustedStart = this.adjustStartForIncompleteDeclarations(adjustedStart);
+    adjustedEnd = this.adjustEndForIncompleteDeclarations(adjustedEnd);
 
     // Check if startLine cuts into a block
     const startPos: Point = { row: adjustedStart - 1, column: 0 };
@@ -2146,6 +2160,105 @@ export class ContextExtractor {
       startLine: Math.max(1, adjustedStart),
       endLine: Math.min(totalLines, adjustedEnd),
     };
+  }
+
+  /**
+   * Adjusts the start line to avoid cutting incomplete declarations.
+   * Looks backward for incomplete const/let/var/function declarations.
+   *
+   * @param startLine Starting line to adjust
+   * @returns Adjusted start line that doesn't cut incomplete declarations
+   */
+  private adjustStartForIncompleteDeclarations(startLine: number): number {
+    let adjustedStart = startLine;
+
+    // Look backward for incomplete declarations
+    for (let line = startLine - 1; line >= Math.max(1, startLine - 3); line--) {
+      const lineContent = this.model.getLineContent(line).trim();
+
+      // Check for incomplete declarations (ending with keywords but no assignment/body)
+      if (
+        /^(const|let|var)\s*$/.test(lineContent) || // Just "const ", "let ", "var "
+        /^(const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(lineContent) || // "const identifier"
+        /^function\s*$/.test(lineContent) || // Just "function "
+        /^function\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(lineContent) // "function name"
+      ) {
+        adjustedStart = line;
+        continue;
+      }
+
+      // If we find a complete statement, stop looking backward
+      if (
+        lineContent.endsWith(";") ||
+        lineContent.endsWith("}") ||
+        lineContent.includes("=")
+      ) {
+        break;
+      }
+
+      // If line is empty or just whitespace, continue looking
+      if (lineContent === "") {
+        continue;
+      }
+
+      // If we find something else, stop
+      break;
+    }
+
+    return adjustedStart;
+  }
+
+  /**
+   * Adjusts the end line to include complete declarations after incomplete ones.
+   * Looks forward to find the completion of incomplete declarations.
+   *
+   * @param endLine Ending line to adjust
+   * @returns Adjusted end line that includes complete declarations
+   */
+  private adjustEndForIncompleteDeclarations(endLine: number): number {
+    let adjustedEnd = endLine;
+    const totalLines = this.model.getLineCount();
+
+    // Check if the end line or lines before it have incomplete declarations
+    for (let line = Math.max(1, endLine - 2); line <= endLine; line++) {
+      const lineContent = this.model.getLineContent(line).trim();
+
+      if (
+        /^(const|let|var)\s*$/.test(lineContent) || // Just "const ", "let ", "var "
+        /^(const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(lineContent) || // "const identifier"
+        /^function\s*$/.test(lineContent) || // Just "function "
+        /^function\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*$/.test(lineContent) // "function name"
+      ) {
+        // Look forward to find the completion
+        for (
+          let nextLine = line + 1;
+          nextLine <= Math.min(totalLines, line + 10);
+          nextLine++
+        ) {
+          const nextContent = this.model.getLineContent(nextLine).trim();
+
+          // Found completion - include it
+          if (
+            nextContent.includes("=") ||
+            nextContent.includes("{") ||
+            nextContent.endsWith(";")
+          ) {
+            adjustedEnd = Math.max(adjustedEnd, nextLine);
+            break;
+          }
+
+          // Found another declaration or empty line - the incomplete one might be truly incomplete
+          if (
+            nextContent.match(/^(const|let|var|function)\s/) ||
+            nextContent === ""
+          ) {
+            break;
+          }
+        }
+      }
+    }
+
+    return adjustedEnd;
   }
 
   /**
