@@ -1,8 +1,6 @@
 import { IconCodeDots } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
-// import type { ExtractedContext } from "./lib/ContextExtractor";
-// import ContextExtractorModule from "./lib/ContextExtractor";
 import { monaco } from "./lib/monacoSetup";
 import {
   ContextExtractor,
@@ -189,21 +187,85 @@ pm.test("Check if zip code is valid", function () {
     };
   }, [updateTreeStatus]);
 
-  // const combineSectionsForPreview = (s: ExtractedContext): string => {
-  //   return [s.linesAroundCursor].filter(Boolean).join("\n\n");
-  // };
-
+  /**
+   * Combines context extraction sections into a single preview string with configurable comment markers.
+   *
+   * This function takes the extracted context sections and intelligently combines them with optional
+   * comment markers to clearly delineate different types of context for better readability.
+   *
+   * @param s The extracted ranked context sections from ContextExtractor
+   * @param config Configuration object for customizing the output format
+   * @returns Combined string with all non-empty sections and their markers
+   *
+   * Features:
+   * - showCommentMarkers: Whether to add comment markers before each section (default: true)
+   * - markerStyle: 'line' for double-slash comments, 'block' for slash-star comments (default: 'line')
+   * - customLabels: Override default section labels
+   *
+   * Example usage:
+   * combineSectionsForPreview(sections, { markerStyle: 'block' })
+   */
   const combineSectionsForPreview = (
-    s: ExtractRankedContextSections
+    s: ExtractRankedContextSections,
+    config: {
+      showCommentMarkers?: boolean;
+      markerStyle?: "line" | "block";
+      customLabels?: {
+        declarations?: string;
+        linesAroundCursor?: string;
+        relevantLines?: string;
+        existingTests?: string;
+      };
+    } = {}
   ): string => {
-    return [
-      s.declarations,
-      s.linesAroundCursor,
-      s.relevantLines,
-      // s.existingTests,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
+    const {
+      showCommentMarkers = true,
+      markerStyle = "line",
+      customLabels = {},
+    } = config;
+
+    const defaultLabels = {
+      declarations: "Global Declarations",
+      linesAroundCursor: "Context Around Cursor",
+      relevantLines: "Similar Code Blocks",
+      existingTests: "Existing Tests",
+    };
+
+    const labels = { ...defaultLabels, ...customLabels };
+
+    const createMarker = (label: string): string => {
+      if (!showCommentMarkers) return "";
+
+      if (markerStyle === "block") {
+        return `/*\n * ${label}\n */\n`;
+      } else {
+        return `// ===== ${label.toUpperCase()} =====\n`;
+      }
+    };
+
+    const sections: string[] = [];
+
+    if (s.declarations?.trim()) {
+      const marker = createMarker(labels.declarations);
+      sections.push(marker + s.declarations);
+    }
+
+    if (s.linesAroundCursor?.trim()) {
+      const marker = createMarker(labels.linesAroundCursor);
+      sections.push(marker + s.linesAroundCursor);
+    }
+
+    if (s.relevantLines?.trim()) {
+      const marker = createMarker(labels.relevantLines);
+      sections.push(marker + s.relevantLines);
+    }
+
+    if (s.existingTests?.trim()) {
+      const marker = createMarker(labels.existingTests);
+      sections.push(marker + s.existingTests);
+    }
+
+    return sections.join("\n\n");
   };
 
   const printDebugLogs = (sections: ExtractRankedContextSections) => {
@@ -264,7 +326,18 @@ pm.test("Check if zip code is valid", function () {
       if (outputEditorInstance.current) {
         const outputModel = outputEditorInstance.current.getModel();
         if (outputModel) {
-          outputModel.setValue(combineSectionsForPreview(sections));
+          outputModel.setValue(
+            combineSectionsForPreview(sections, {
+              showCommentMarkers: true,
+              markerStyle: "line",
+              customLabels: {
+                declarations: "Global Declarations",
+                linesAroundCursor: "Context Around Cursor",
+                relevantLines: "Similar Code Blocks",
+                existingTests: "Existing Tests",
+              },
+            })
+          );
         }
       }
 
