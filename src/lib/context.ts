@@ -45,6 +45,35 @@ export interface GlobalDeclarationsOptions {
 }
 
 /**
+ * Options for relevant blocks extraction
+ */
+export interface RelevantBlocksOptions {
+  /**
+   * Number of most similar blocks to return
+   * @default 3
+   */
+  topK?: number;
+
+  /**
+   * Maximum number of characters to include for relevant blocks
+   * @default 1500
+   */
+  maxCharsBudget?: number;
+
+  /**
+   * Whether to include leading comments with blocks
+   * @default true
+   */
+  includeLeadingComments?: boolean;
+
+  /**
+   * Minimum similarity threshold (0-1) to include a block
+   * @default 0.05
+   */
+  minSimilarityThreshold?: number;
+}
+
+/**
  * Result of global declarations extraction
  */
 export interface GlobalDeclarationsResult {
@@ -74,6 +103,50 @@ export interface GlobalDeclarationsResult {
     otherCount: number;
     budgetUsed: number;
     budgetLimit: number;
+  };
+}
+
+/**
+ * Result of relevant blocks extraction
+ */
+export interface RelevantBlocksResult {
+  /**
+   * The extracted relevant blocks text
+   */
+  text: string;
+
+  /**
+   * Array of similar blocks included in the result
+   */
+  blocks: Array<{
+    startOffset: number;
+    endOffset: number;
+    blockType: string;
+    similarity: number;
+    commonTokens: string[];
+    totalTokens: number;
+  }>;
+
+  /**
+   * Information about the current block that was used for comparison
+   */
+  currentBlock: {
+    startOffset: number;
+    endOffset: number;
+    tokens: string[];
+    blockType: string;
+  };
+
+  /**
+   * Metadata about the extraction
+   */
+  meta: {
+    totalBlocksAnalyzed: number;
+    blocksAboveThreshold: number;
+    topKSelected: number;
+    budgetUsed: number;
+    budgetLimit: number;
+    averageSimilarity: number;
   };
 }
 
@@ -1186,6 +1259,214 @@ export class ContextExtractor {
   }
 
   /**
+   * Extracts relevant blocks/lines based on token similarity with the current block being edited.
+   *
+   * Tokenization strategy:
+   * - Processes each line using delimiters (whitespace, operators, brackets, etc.)
+   * - Converts camelCase and snake_case to individual words
+   * - Filters out stopwords and very short tokens
+   *
+   * Similarity calculation:
+   * - Uses Jaccard similarity between token sets
+   * - Returns top K (default=3) most similar blocks
+   * - Maintains original file order for output
+   *
+   * @param cursor Current cursor position to determine the editing context
+   * @param opts Configuration options for extraction
+   * @returns Relevant blocks result with similar blocks and metadata
+   *
+   * @example
+   * ```typescript
+   * const relevant = extractor.getRelevantBlocks(
+   *   { lineNumber: 42, column: 10 },
+   *   { topK: 3, minSimilarityThreshold: 0.2 }
+   * );
+   * console.log(`Found ${relevant.blocks.length} similar blocks`);
+   * relevant.blocks.forEach(block => {
+   *   console.log(`${block.blockType}: ${block.similarity.toFixed(2)} similarity`);
+   * });
+   * ```
+   */
+  public getRelevantBlocks(
+    cursor: Position,
+    opts: RelevantBlocksOptions = {}
+  ): RelevantBlocksResult {
+    this.ensureIncrementalParseUpToDate();
+
+    const topK = opts.topK ?? 3;
+    const maxBudget = opts.maxCharsBudget ?? 1500;
+    const includeComments = opts.includeLeadingComments ?? true;
+    const minThreshold = opts.minSimilarityThreshold ?? 0.05; // Lower threshold to include more blocks
+
+    // Get the current block being edited
+    const currentBlockInfo = this.getCurrentBlockForSimilarity(cursor);
+    if (!currentBlockInfo) {
+      return {
+        text: "",
+        blocks: [],
+        currentBlock: {
+          startOffset: 0,
+          endOffset: 0,
+          tokens: [],
+          blockType: "unknown",
+        },
+        meta: {
+          totalBlocksAnalyzed: 0,
+          blocksAboveThreshold: 0,
+          topKSelected: 0,
+          budgetUsed: 0,
+          budgetLimit: maxBudget,
+          averageSimilarity: 0,
+        },
+      };
+    }
+
+    // Tokenize the current block
+    const currentTokens = this.tokenizeBlockLineByLine(
+      currentBlockInfo.startOffset,
+      currentBlockInfo.endOffset
+    );
+    const currentTokenSet = new Set(currentTokens);
+
+    // Get all other blocks for comparison
+    const allBlocks = this.collectAllBlocksForSimilarity(currentBlockInfo);
+
+    if (allBlocks.length === 0) {
+      return {
+        text: "",
+        blocks: [],
+        currentBlock: {
+          startOffset: currentBlockInfo.startOffset,
+          endOffset: currentBlockInfo.endOffset,
+          tokens: currentTokens,
+          blockType: currentBlockInfo.blockType,
+        },
+        meta: {
+          totalBlocksAnalyzed: 0,
+          blocksAboveThreshold: 0,
+          topKSelected: 0,
+          budgetUsed: 0,
+          budgetLimit: maxBudget,
+          averageSimilarity: 0,
+        },
+      };
+    }
+
+    // Calculate similarity for each block
+    type ScoredBlock = {
+      startOffset: number;
+      endOffset: number;
+      blockType: string;
+      node: Node;
+      similarity: number;
+      tokens: string[];
+      commonTokens: string[];
+    };
+
+    const scoredBlocks: ScoredBlock[] = [];
+
+    for (const block of allBlocks) {
+      const blockTokens = this.tokenizeBlockLineByLine(
+        block.startOffset,
+        block.endOffset
+      );
+      const blockTokenSet = new Set(blockTokens);
+
+      // Calculate Jaccard similarity
+      const similarity = jaccard(currentTokenSet, blockTokenSet);
+
+      // Find common tokens for debugging
+      const commonTokens = currentTokens.filter((token) =>
+        blockTokenSet.has(token)
+      );
+
+      // Only include blocks above threshold
+      if (similarity >= minThreshold) {
+        scoredBlocks.push({
+          startOffset: block.startOffset,
+          endOffset: block.endOffset,
+          blockType: block.blockType,
+          node: block.node,
+          similarity,
+          tokens: blockTokens,
+          commonTokens,
+        });
+      }
+    }
+
+    // Sort by similarity (highest first), then by file position
+    scoredBlocks.sort((a, b) => {
+      if (Math.abs(b.similarity - a.similarity) > 0.001) {
+        return b.similarity - a.similarity;
+      }
+      return a.startOffset - b.startOffset;
+    });
+
+    // Select top K blocks within budget
+    const selectedBlocks: ScoredBlock[] = [];
+    let budgetUsed = 0;
+
+    for (const block of scoredBlocks) {
+      if (selectedBlocks.length >= topK) break;
+
+      const blockSize = block.endOffset - block.startOffset;
+      if (budgetUsed + blockSize <= maxBudget) {
+        selectedBlocks.push(block);
+        budgetUsed += blockSize;
+      }
+    }
+
+    // Sort selected blocks by file order for output
+    selectedBlocks.sort((a, b) => a.startOffset - b.startOffset);
+
+    // Generate text ranges
+    const ranges = selectedBlocks.map((block) => {
+      const range = includeComments
+        ? this.expandNodeToFullLinesWithLeadingComments(block.node)
+        : this.expandNodeToFullLines(block.node);
+
+      return {
+        startOffset: range.startOffset,
+        endOffset: range.endOffset,
+        blockType: block.blockType,
+        similarity: block.similarity,
+        commonTokens: block.commonTokens,
+        totalTokens: block.tokens.length,
+      };
+    });
+
+    // Generate final text
+    const text = this.textFromRanges(ranges);
+
+    // Calculate metadata
+    const totalSimilarities = scoredBlocks.reduce(
+      (sum, block) => sum + block.similarity,
+      0
+    );
+    const averageSimilarity =
+      scoredBlocks.length > 0 ? totalSimilarities / scoredBlocks.length : 0;
+
+    return {
+      text,
+      blocks: ranges,
+      currentBlock: {
+        startOffset: currentBlockInfo.startOffset,
+        endOffset: currentBlockInfo.endOffset,
+        tokens: currentTokens,
+        blockType: currentBlockInfo.blockType,
+      },
+      meta: {
+        totalBlocksAnalyzed: allBlocks.length,
+        blocksAboveThreshold: scoredBlocks.length,
+        topKSelected: selectedBlocks.length,
+        budgetUsed,
+        budgetLimit: maxBudget,
+        averageSimilarity,
+      },
+    };
+  }
+
+  /**
    * Extracts the primary identifier names from a declaration node.
    * Handles function declarations, variable declarations, etc.
    *
@@ -1218,6 +1499,319 @@ export class ContextExtractor {
     }
 
     return names;
+  }
+
+  /**
+   * Tokenizes a block of code line by line using advanced tokenization strategy.
+   * Converts camelCase and snake_case to individual words and uses delimiters.
+   *
+   * Example transformations:
+   * - `const userName = pm.response.json().userName` → ["const", "user", "name", "pm", "response", "json"]
+   * - `pm.test("Check for response body schema", function() {` → ["pm", "test", "check", "response", "body", "schema", "function"]
+   *
+   * @param startOffset Starting offset of the block
+   * @param endOffset Ending offset of the block
+   * @returns Array of tokens from all lines in the block
+   */
+  private tokenizeBlockLineByLine(
+    startOffset: number,
+    endOffset: number
+  ): string[] {
+    const startPos = this.model.getPositionAt(startOffset);
+    const endPos = this.model.getPositionAt(endOffset);
+
+    const allTokens: string[] = [];
+
+    // Process each line in the block
+    for (
+      let lineNum = startPos.lineNumber;
+      lineNum <= endPos.lineNumber;
+      lineNum++
+    ) {
+      const lineContent = this.model.getLineContent(lineNum);
+      const lineTokens = this.tokenizeLineWithDelimiters(lineContent);
+      allTokens.push(...lineTokens);
+    }
+
+    // Remove duplicates while preserving order
+    const seen = new Set<string>();
+    const uniqueTokens: string[] = [];
+    for (const token of allTokens) {
+      if (!seen.has(token)) {
+        seen.add(token);
+        uniqueTokens.push(token);
+      }
+    }
+
+    return uniqueTokens;
+  }
+
+  /**
+   * Tokenizes a single line using delimiters and camelCase/snake_case conversion.
+   * Applies the specific tokenization strategy requested.
+   *
+   * @param line Line of code to tokenize
+   * @returns Array of tokens from the line
+   */
+  private tokenizeLineWithDelimiters(line: string): string[] {
+    if (!line || !line.trim()) return [];
+
+    // Remove comments first
+    const cleanLine = line.replace(/\/\/.*$/, "").replace(/\/\*.*?\*\//g, "");
+
+    // Define delimiters: whitespace, operators, brackets, quotes, etc.
+    const delimiters = /[\s()[\]{}.;,=+\-*/!&|<>?:'"`,~@#$%^]+/g;
+
+    // Split by delimiters and filter out empty strings
+    const rawTokens = cleanLine.split(delimiters).filter(Boolean);
+
+    const processedTokens: string[] = [];
+
+    for (const token of rawTokens) {
+      // Skip very short tokens and pure numbers
+      if (token.length <= 1 || /^\d+$/.test(token)) continue;
+
+      // Convert camelCase and snake_case to individual words
+      const words = splitCamelSnake(token.toLowerCase());
+
+      for (const word of words) {
+        // Filter out stopwords and very short words
+        if (word.length > 1 && !CODE_STOPWORDS.has(word)) {
+          processedTokens.push(word);
+        }
+      }
+    }
+
+    return processedTokens;
+  }
+
+  /**
+   * Gets the block type description for a given AST node.
+   * Used for categorizing blocks in similarity analysis.
+   *
+   * @param node AST node to categorize
+   * @returns Human-readable block type
+   */
+  private getBlockType(node: Node): string {
+    switch (node.type) {
+      case "function_declaration":
+        return "function";
+      case "lexical_declaration":
+      case "variable_declaration":
+        return "variable_declaration";
+      case "call_expression": {
+        // Check if it's a pm.test call
+        const callee = node.child(0);
+        if (callee?.type === "member_expression") {
+          const obj = callee.child(0);
+          const prop = callee.child(2);
+          if (
+            obj?.type === "identifier" &&
+            obj.text === "pm" &&
+            prop?.text === "test"
+          ) {
+            return "pm_test";
+          }
+        }
+        return "function_call";
+      }
+      case "if_statement":
+        return "if_statement";
+      case "for_statement":
+      case "for_in_statement":
+      case "for_of_statement":
+        return "loop";
+      case "try_statement":
+        return "try_catch";
+      case "class_declaration":
+        return "class";
+      case "expression_statement":
+        return "expression";
+      default:
+        return node.type;
+    }
+  }
+
+  /**
+   * Gets the current block being edited for similarity analysis.
+   * Determines the appropriate block scope based on cursor position.
+   *
+   * @param cursor Current cursor position
+   * @returns Block information or null if no suitable block found
+   */
+  private getCurrentBlockForSimilarity(cursor: Position): {
+    startOffset: number;
+    endOffset: number;
+    blockType: string;
+    node: Node;
+  } | null {
+    if (!this.tree) return null;
+
+    const tsPos: Point = {
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    };
+    const nodeAtCursor = this.tree.rootNode.descendantForPosition(tsPos);
+
+    if (!nodeAtCursor) return null;
+
+    // Try to find the most appropriate block for similarity comparison
+    // Priority: function > pm.test > class > control flow > expression statement
+    let current: Node | null = nodeAtCursor;
+    while (current && current !== this.tree.rootNode) {
+      // Check for function-like blocks first (highest priority)
+      if (this.isFunctionLike(current)) {
+        const wrapped = this.wrapFunctionIfArgument(current);
+        const range = this.expandNodeToFullLines(wrapped);
+        return {
+          startOffset: range.startOffset,
+          endOffset: range.endOffset,
+          blockType: this.getBlockType(wrapped),
+          node: wrapped,
+        };
+      }
+
+      // Check for other block types
+      if (this.isWholeBlockCandidate(current)) {
+        const container = this.wholeBlockContainer(current);
+        const range = this.expandNodeToFullLines(container);
+        return {
+          startOffset: range.startOffset,
+          endOffset: range.endOffset,
+          blockType: this.getBlockType(container),
+          node: container,
+        };
+      }
+
+      current = current.parent;
+    }
+
+    // Fallback: use the nearest top-level statement
+    const topLevel = this.topLevelAncestor(nodeAtCursor);
+    if (topLevel) {
+      const range = this.expandNodeToFullLines(topLevel);
+      return {
+        startOffset: range.startOffset,
+        endOffset: range.endOffset,
+        blockType: this.getBlockType(topLevel),
+        node: topLevel,
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Collects all blocks in the file that can be used for similarity comparison.
+   * Excludes the current block to avoid self-comparison.
+   *
+   * @param currentBlock Information about the current block being edited
+   * @returns Array of blocks available for similarity analysis
+   */
+  private collectAllBlocksForSimilarity(currentBlock: {
+    startOffset: number;
+    endOffset: number;
+    blockType: string;
+    node: Node;
+  }): Array<{
+    startOffset: number;
+    endOffset: number;
+    blockType: string;
+    node: Node;
+  }> {
+    if (!this.tree) return [];
+
+    const blocks: Array<{
+      startOffset: number;
+      endOffset: number;
+      blockType: string;
+      node: Node;
+    }> = [];
+
+    const root = this.tree.rootNode;
+
+    // Collect all top-level blocks
+    for (let i = 0; i < root.namedChildCount; i++) {
+      const child = root.namedChild(i)!;
+
+      if (!this.isWholeBlockCandidate(child)) continue;
+
+      const container = this.wholeBlockContainer(child);
+      const range = this.expandNodeToFullLines(container);
+
+      // Skip the current block (avoid self-comparison)
+      if (
+        range.startOffset === currentBlock.startOffset &&
+        range.endOffset === currentBlock.endOffset
+      ) {
+        continue;
+      }
+
+      // Skip very small blocks (single line or empty)
+      const startLine = this.model.getPositionAt(range.startOffset).lineNumber;
+      const endLine = this.model.getPositionAt(range.endOffset).lineNumber;
+      if (endLine <= startLine) continue;
+
+      blocks.push({
+        startOffset: range.startOffset,
+        endOffset: range.endOffset,
+        blockType: this.getBlockType(container),
+        node: container,
+      });
+    }
+
+    // Also collect nested function blocks within other blocks
+    const collectNestedFunctions = (node: Node, depth: number = 0) => {
+      // Limit depth to avoid infinite recursion
+      if (depth > 5) return;
+
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i)!;
+
+        if (this.isFunctionLike(child)) {
+          const wrapped = this.wrapFunctionIfArgument(child);
+          const range = this.expandNodeToFullLines(wrapped);
+
+          // Skip the current block and duplicates
+          const isDuplicate = blocks.some(
+            (b) =>
+              b.startOffset === range.startOffset &&
+              b.endOffset === range.endOffset
+          );
+          const isCurrent =
+            range.startOffset === currentBlock.startOffset &&
+            range.endOffset === currentBlock.endOffset;
+
+          if (!isDuplicate && !isCurrent) {
+            // Check minimum size (must span multiple lines)
+            const startLine = this.model.getPositionAt(
+              range.startOffset
+            ).lineNumber;
+            const endLine = this.model.getPositionAt(
+              range.endOffset
+            ).lineNumber;
+            if (endLine > startLine) {
+              blocks.push({
+                startOffset: range.startOffset,
+                endOffset: range.endOffset,
+                blockType: this.getBlockType(wrapped),
+                node: wrapped,
+              });
+            }
+          }
+        }
+
+        // Recursively check children
+        collectNestedFunctions(child, depth + 1);
+      }
+    };
+
+    collectNestedFunctions(root);
+
+    // Sort by file position
+    blocks.sort((a, b) => a.startOffset - b.startOffset);
+
+    return blocks;
   }
 
   /**
@@ -2972,19 +3566,26 @@ export class ContextExtractor {
         )
       ),
     ];
-    const declarations = this.textFromRanges(declRanges);
+    const declarations = this.getGlobalDeclarations(cursor, {
+      maxCharsBudget: 500,
+    });
 
     const relevantRanges = pickedC.map((r) => ({
       startOffset: r.startOffset,
       endOffset: r.endOffset,
     }));
-    const relevantLines = this.textFromRanges(relevantRanges);
+    const relevantLines = this.getRelevantBlocks(cursor, {
+      topK: 5,
+      minSimilarityThreshold: 0.05,
+      includeLeadingComments: true,
+      maxCharsBudget: 1500,
+    });
 
     // ---- Emit ----
     const res: ExtractRankedContextSections = {
       linesAroundCursor,
-      declarations,
-      relevantLines,
+      declarations: declarations.text,
+      relevantLines: relevantLines.text,
       existingTests,
       meta: {
         strategy: tierA.strategy,

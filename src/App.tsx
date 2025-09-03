@@ -211,9 +211,9 @@ pm.test("Check if zip code is valid", function () {
     s: ExtractRankedContextSections
   ): string => {
     return [
-      s.linesAroundCursor,
-      s.declarations,
-      // s.relevantLines,
+      // s.linesAroundCursor,
+      // s.declarations,
+      s.relevantLines,
       // s.existingTests,
     ]
       .filter(Boolean)
@@ -228,6 +228,8 @@ pm.test("Check if zip code is valid", function () {
     console.log(sections.linesAroundCursor);
     console.log("=== Declarations ===");
     console.log(sections.declarations);
+    console.log("=== Relevant lines ===");
+    console.log(sections.relevantLines);
   };
 
   // Function for processing code using the context extractor
