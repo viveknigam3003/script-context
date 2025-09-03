@@ -28,6 +28,56 @@ import CODE_STOPWORDS from "./stopwords";
 type Position = { lineNumber: number; column: number };
 
 /**
+ * Options for global declarations extraction
+ */
+export interface GlobalDeclarationsOptions {
+  /**
+   * Maximum number of characters to include for global declarations
+   * @default 2000
+   */
+  maxCharsBudget?: number;
+
+  /**
+   * Whether to include leading comments with declarations
+   * @default true
+   */
+  includeLeadingComments?: boolean;
+}
+
+/**
+ * Result of global declarations extraction
+ */
+export interface GlobalDeclarationsResult {
+  /**
+   * The extracted global declarations text
+   */
+  text: string;
+
+  /**
+   * Array of declaration ranges included in the result
+   */
+  declarations: Array<{
+    startOffset: number;
+    endOffset: number;
+    name: string;
+    priority: "current-scope" | "high-usage" | "other";
+    usageCount: number;
+  }>;
+
+  /**
+   * Metadata about the extraction
+   */
+  meta: {
+    totalDeclarations: number;
+    currentScopeCount: number;
+    highUsageCount: number;
+    otherCount: number;
+    budgetUsed: number;
+    budgetLimit: number;
+  };
+}
+
+/**
  * Configuration options for context extraction
  */
 export interface ContextOptions {
@@ -965,6 +1015,212 @@ export class ContextExtractor {
   }
 
   /**
+   * Extracts global declarations based on the currently editing block with intelligent prioritization.
+   *
+   * Priority logic:
+   * 1. Declarations called/read in current block scope (up to topmost level)
+   * 2. Most used declarations across the entire file
+   * 3. Other available declarations if budget allows
+   *
+   * Always maintains proper order (as they appear in file) and never cuts lines.
+   *
+   * @param cursor Current cursor position to determine the editing context
+   * @param opts Configuration options for extraction
+   * @returns Global declarations result with prioritized text and metadata
+   *
+   * @example
+   * ```typescript
+   * const declarations = extractor.getGlobalDeclarations(
+   *   { lineNumber: 42, column: 10 },
+   *   { maxCharsBudget: 2000 }
+   * );
+   * console.log(declarations.text);
+   * console.log(`Found ${declarations.meta.currentScopeCount} current scope declarations`);
+   * ```
+   */
+  public getGlobalDeclarations(
+    cursor: Position,
+    opts: GlobalDeclarationsOptions = {}
+  ): GlobalDeclarationsResult {
+    this.ensureIncrementalParseUpToDate();
+
+    const maxBudget = opts.maxCharsBudget ?? 2000;
+    const includeComments = opts.includeLeadingComments ?? true;
+
+    // Get all global declarations
+    const allDeclarations = this.collectGlobalBlockCandidates();
+    if (allDeclarations.length === 0) {
+      return {
+        text: "",
+        declarations: [],
+        meta: {
+          totalDeclarations: 0,
+          currentScopeCount: 0,
+          highUsageCount: 0,
+          otherCount: 0,
+          budgetUsed: 0,
+          budgetLimit: maxBudget,
+        },
+      };
+    }
+
+    // Analyze usage patterns
+    const usageFrequency = this.analyzeGlobalUsageFrequency();
+    const currentScopeIdentifiers =
+      this.getIdentifiersUsedInCurrentScope(cursor);
+
+    // Categorize declarations by priority
+    type DeclarationWithPriority = {
+      declaration: BlockRange;
+      name: string;
+      priority: "current-scope" | "high-usage" | "other";
+      usageCount: number;
+      size: number;
+    };
+
+    const categorized: DeclarationWithPriority[] = [];
+
+    for (const decl of allDeclarations) {
+      // Extract the primary name from this declaration
+      const names = this.extractDeclarationNames(decl.node);
+      const primaryName = names[0] || "unknown";
+      const usageCount = usageFrequency.get(primaryName) || 0;
+
+      // Determine priority
+      let priority: DeclarationWithPriority["priority"] = "other";
+      if (currentScopeIdentifiers.has(primaryName)) {
+        priority = "current-scope";
+      } else if (usageCount >= 2) {
+        // Consider high-usage if used 2+ times across the file
+        priority = "high-usage";
+      }
+
+      const size = decl.endOffset - decl.startOffset;
+
+      categorized.push({
+        declaration: decl,
+        name: primaryName,
+        priority,
+        usageCount,
+        size,
+      });
+    }
+
+    // Sort within each priority group:
+    // - Current scope: by usage count desc, then by file order
+    // - High usage: by usage count desc, then by file order
+    // - Other: by file order (startOffset)
+    const sortedDeclarations = [
+      ...categorized
+        .filter((d) => d.priority === "current-scope")
+        .sort((a, b) => {
+          if (b.usageCount !== a.usageCount) return b.usageCount - a.usageCount;
+          return a.declaration.startOffset - b.declaration.startOffset;
+        }),
+      ...categorized
+        .filter((d) => d.priority === "high-usage")
+        .sort((a, b) => {
+          if (b.usageCount !== a.usageCount) return b.usageCount - a.usageCount;
+          return a.declaration.startOffset - b.declaration.startOffset;
+        }),
+      ...categorized
+        .filter((d) => d.priority === "other")
+        .sort((a, b) => a.declaration.startOffset - b.declaration.startOffset),
+    ];
+
+    // Select declarations within budget, maintaining file order for final output
+    const selected: DeclarationWithPriority[] = [];
+    let budgetUsed = 0;
+
+    for (const decl of sortedDeclarations) {
+      if (budgetUsed + decl.size <= maxBudget) {
+        selected.push(decl);
+        budgetUsed += decl.size;
+      }
+    }
+
+    // Sort selected declarations by file order for output
+    selected.sort(
+      (a, b) => a.declaration.startOffset - b.declaration.startOffset
+    );
+
+    // Extract text ranges
+    const ranges = selected.map((decl) => {
+      const range = includeComments
+        ? this.expandNodeToFullLinesWithLeadingComments(decl.declaration.node)
+        : this.expandNodeToFullLines(decl.declaration.node);
+
+      return {
+        startOffset: range.startOffset,
+        endOffset: range.endOffset,
+        name: decl.name,
+        priority: decl.priority,
+        usageCount: decl.usageCount,
+      };
+    });
+
+    // Generate final text
+    const text = this.textFromRanges(ranges);
+
+    // Calculate metadata
+    const currentScopeCount = selected.filter(
+      (d) => d.priority === "current-scope"
+    ).length;
+    const highUsageCount = selected.filter(
+      (d) => d.priority === "high-usage"
+    ).length;
+    const otherCount = selected.filter((d) => d.priority === "other").length;
+
+    return {
+      text,
+      declarations: ranges,
+      meta: {
+        totalDeclarations: allDeclarations.length,
+        currentScopeCount,
+        highUsageCount,
+        otherCount,
+        budgetUsed,
+        budgetLimit: maxBudget,
+      },
+    };
+  }
+
+  /**
+   * Extracts the primary identifier names from a declaration node.
+   * Handles function declarations, variable declarations, etc.
+   *
+   * @param node Declaration node to analyze
+   * @returns Array of identifier names (primary name first)
+   */
+  private extractDeclarationNames(node: Node): string[] {
+    const names: string[] = [];
+
+    if (node.type === "function_declaration") {
+      const name = node.childForFieldName("name")?.text;
+      if (name) names.push(name);
+    } else if (
+      node.type === "lexical_declaration" ||
+      node.type === "variable_declaration"
+    ) {
+      // Walk through declarators to find identifier names
+      const collectNames = (n: Node) => {
+        if (n.type === "variable_declarator") {
+          const id = n.childForFieldName("name");
+          if (id?.type === "identifier" && id.text) {
+            names.push(id.text);
+          }
+        }
+        for (let i = 0; i < n.namedChildCount; i++) {
+          collectNames(n.namedChild(i)!);
+        }
+      };
+      collectNames(node);
+    }
+
+    return names;
+  }
+
+  /**
    * Checks if a node represents a function-like construct
    * @param n Node to check
    * @returns True if node is function-like
@@ -1538,6 +1794,105 @@ export class ContextExtractor {
     // free = reads \ defs
     defs.forEach((d) => reads.delete(d));
     return reads;
+  }
+
+  /**
+   * Analyzes identifier usage frequency across the entire file.
+   * Returns a map of identifier names to their usage count.
+   *
+   * @returns Map from identifier name to usage count
+   */
+  private analyzeGlobalUsageFrequency(): Map<string, number> {
+    if (!this.tree) return new Map();
+
+    const usageCount = new Map<string, number>();
+
+    const countUsage = (node: Node) => {
+      if (node.type === "identifier") {
+        const parent = node.parent;
+        const name = node.text;
+
+        // Count as usage if it's not a definition site
+        const isDef =
+          (parent?.type === "variable_declarator" &&
+            parent.firstNamedChild === node) ||
+          (parent?.type === "function_declaration" &&
+            parent.childForFieldName("name") === node) ||
+          (parent?.type === "property_definition" &&
+            parent.childForFieldName("key") === node);
+
+        if (!isDef && name) {
+          usageCount.set(name, (usageCount.get(name) || 0) + 1);
+        }
+      }
+
+      // Recursively count in all children
+      for (let i = 0; i < node.namedChildCount; i++) {
+        countUsage(node.namedChild(i)!);
+      }
+    };
+
+    countUsage(this.tree.rootNode);
+    return usageCount;
+  }
+
+  /**
+   * Gets identifiers that are called or read within a specific block scope.
+   * Analyzes the current block and all its ancestors up to the topmost level.
+   *
+   * @param cursor Current cursor position
+   * @returns Set of identifier names used in the current block scope
+   */
+  private getIdentifiersUsedInCurrentScope(cursor: Position): Set<string> {
+    if (!this.tree) return new Set();
+
+    const tsPos: Point = {
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    };
+    const nodeAtCursor = this.tree.rootNode.descendantForPosition(tsPos);
+
+    if (!nodeAtCursor) return new Set();
+
+    // Find the current enclosing block
+    const enclosingBlock = this.getCurrentEnclosingBlock(cursor);
+    if (!enclosingBlock) {
+      // If at top level, analyze the entire file
+      return new Set(this.analyzeGlobalUsageFrequency().keys());
+    }
+
+    // Get the topmost parent to define the scope boundary
+    const topmostParent =
+      this.topLevelAncestor(enclosingBlock) ?? enclosingBlock;
+
+    // Collect all identifiers used within the topmost parent scope
+    const usedIdentifiers = new Set<string>();
+
+    const collectIdentifiers = (node: Node) => {
+      if (node.type === "identifier") {
+        const parent = node.parent;
+        const name = node.text;
+
+        // Count as usage if it's not a definition site
+        const isDef =
+          (parent?.type === "variable_declarator" &&
+            parent.firstNamedChild === node) ||
+          (parent?.type === "function_declaration" &&
+            parent.childForFieldName("name") === node);
+
+        if (!isDef && name) {
+          usedIdentifiers.add(name);
+        }
+      }
+
+      // Recursively collect from all children
+      for (let i = 0; i < node.namedChildCount; i++) {
+        collectIdentifiers(node.namedChild(i)!);
+      }
+    };
+
+    collectIdentifiers(topmostParent);
+    return usedIdentifiers;
   }
 
   /**

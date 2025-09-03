@@ -212,7 +212,7 @@ pm.test("Check if zip code is valid", function () {
   ): string => {
     return [
       s.linesAroundCursor,
-      // s.declarations,
+      s.declarations,
       // s.relevantLines,
       // s.existingTests,
     ]
@@ -226,6 +226,8 @@ pm.test("Check if zip code is valid", function () {
     console.log(sections.debug);
     console.log("=== Lines around ===");
     console.log(sections.linesAroundCursor);
+    console.log("=== Declarations ===");
+    console.log(sections.declarations);
   };
 
   // Function for processing code using the context extractor
