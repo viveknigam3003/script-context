@@ -211,8 +211,8 @@ pm.test("Check if zip code is valid", function () {
     s: ExtractRankedContextSections
   ): string => {
     return [
-      // s.linesAroundCursor,
-      // s.declarations,
+      s.linesAroundCursor,
+      s.declarations,
       s.relevantLines,
       // s.existingTests,
     ]

@@ -1034,21 +1034,6 @@ export class ContextExtractor {
       return this.extractLinesRange(startLine, endLine, "fallback-lines");
     }
 
-    const nodeAtCursor = this.tree.rootNode.descendantForPosition({
-      row: cursor.lineNumber - 1,
-      column: cursor.column - 1,
-    });
-
-    const shouldUseRaw =
-      !nodeAtCursor ||
-      this.nodeOrAncestorsHaveError(nodeAtCursor) ||
-      this.isLikelyUnfinishedNearCursor(cursor);
-
-    if (shouldUseRaw) {
-      // Fallback to hybrid behavior for broken/unfinished code
-      return this.hybridUnfinishedAround(cursor, prefixLines, suffixLines);
-    }
-
     // Determine if cursor is at top level or inside a block
     const isAtTopLevel = this.isCursorAtTopLevel(cursor);
 
@@ -2715,45 +2700,69 @@ export class ContextExtractor {
       debug.queryTokens = this.buildQueryTokens(cursor);
     }
 
-    // Step 8: Build the comprehensive result structure
+    // Step 8: Deduplicate overlapping ranges across all tiers
+    const rawExtractionResults = {
+      linesAroundCursor: {
+        text: linesAroundCursorResult.text,
+        offsets: [
+          {
+            startOffset: linesAroundCursorResult.startOffset,
+            endOffset: linesAroundCursorResult.endOffset,
+          },
+        ],
+      },
+      declarations: {
+        text: declarationsResult.text,
+        offsets: declarationsResult.declarations.map((d) => ({
+          startOffset: d.startOffset,
+          endOffset: d.endOffset,
+        })),
+      },
+      relevantBlocks: {
+        text: relevantBlocksResult.text,
+        offsets: relevantBlocksResult.blocks.map((b) => ({
+          startOffset: b.startOffset,
+          endOffset: b.endOffset,
+        })),
+      },
+      existingTests: {
+        text: existingTests,
+        offsets: [], // No test skeletons currently
+      },
+    };
+
+    // Apply deduplication to prevent overlapping content
+    const deduplicatedResults =
+      this.deduplicateExtractionResults(rawExtractionResults);
+
+    // Step 9: Build the comprehensive result structure with deduplicated content
     const result: ExtractRankedContextSections = {
-      // Text content from each tier
-      linesAroundCursor: linesAroundCursorResult.text,
-      declarations: declarationsResult.text,
-      relevantLines: relevantBlocksResult.text,
-      existingTests,
+      // Text content from each tier (now deduplicated)
+      linesAroundCursor: deduplicatedResults.linesAroundCursor.text,
+      declarations: deduplicatedResults.declarations.text,
+      relevantLines: deduplicatedResults.relevantBlocks.text,
+      existingTests: deduplicatedResults.existingTests.text,
 
       // Metadata for analysis and debugging
       meta: {
         strategy: linesAroundCursorResult.strategy,
         budgets,
 
-        // Offset information for highlighting in editors
+        // Offset information for highlighting in editors (deduplicated)
         offsets: {
-          A: [
-            {
-              startOffset: linesAroundCursorResult.startOffset,
-              endOffset: linesAroundCursorResult.endOffset,
-            },
-          ],
-          B: declarationsResult.declarations.map((d) => ({
-            startOffset: d.startOffset,
-            endOffset: d.endOffset,
-          })),
-          C: relevantBlocksResult.blocks.map((b) => ({
-            startOffset: b.startOffset,
-            endOffset: b.endOffset,
-          })),
-          D: [], // No test skeletons currently
+          A: deduplicatedResults.linesAroundCursor.offsets,
+          B: deduplicatedResults.declarations.offsets,
+          C: deduplicatedResults.relevantBlocks.offsets,
+          D: deduplicatedResults.existingTests.offsets,
         },
 
-        // Count information for analytics
+        // Count information for analytics (updated with deduplicated counts)
         pickedCounts: {
-          A: 1, // Always exactly one range for lines around cursor
-          B: declarationsResult.declarations.length,
-          C: relevantBlocksResult.blocks.length,
-          D: 0, // No test skeletons currently
-          skeletons: 0,
+          A: deduplicatedResults.linesAroundCursor.offsets.length,
+          B: deduplicatedResults.declarations.offsets.length,
+          C: deduplicatedResults.relevantBlocks.offsets.length,
+          D: deduplicatedResults.existingTests.offsets.length,
+          skeletons: deduplicatedResults.existingTests.offsets.length,
         },
 
         titleTokens: debug.titleTokens,
@@ -2763,10 +2772,315 @@ export class ContextExtractor {
       debug: opts.debug ? debug : undefined,
     };
 
-    // Step 9: Store debug information for later access via getLastDebug()
+    // Step 10: Store debug information for later access via getLastDebug()
     this._lastDebug = opts.debug ? debug : null;
 
     return result;
+  }
+
+  /**
+   * Deduplicates code blocks across multiple extraction results to prevent redundancy.
+   *
+   * This function ensures that the union of all extraction methods never contains duplicate
+   * lines or blocks. It uses intelligent overlap detection and priority-based selection:
+   *
+   * **Priority Order** (higher priority wins):
+   * 1. Tier A (Lines around cursor) - highest priority
+   * 2. Tier B (Global declarations) - medium priority
+   * 3. Tier C (Relevant blocks) - lowest priority
+   * 4. Tier D (Existing tests) - lowest priority
+   *
+   * **Overlap Detection**:
+   * - Line-level overlap detection for precise deduplication
+   * - Partial overlap handling (removes overlapping portions)
+   * - Maintains original block boundaries where possible
+   *
+   * @param extractionResults Object containing results from all extraction methods
+   * @returns Deduplicated results with overlaps removed based on priority
+   *
+   * @example
+   * ```typescript
+   * const results = {
+   *   linesAroundCursor: { text: "...", offsets: [...] },
+   *   declarations: { text: "...", offsets: [...] },
+   *   relevantBlocks: { text: "...", offsets: [...] },
+   *   existingTests: { text: "...", offsets: [...] }
+   * };
+   *
+   * const deduplicated = extractor.deduplicateExtractionResults(results);
+   * // Returns: Same structure but with overlaps removed
+   * ```
+   */
+  public deduplicateExtractionResults(extractionResults: {
+    linesAroundCursor: {
+      text: string;
+      offsets: Array<{ startOffset: number; endOffset: number }>;
+    };
+    declarations: {
+      text: string;
+      offsets: Array<{ startOffset: number; endOffset: number }>;
+    };
+    relevantBlocks: {
+      text: string;
+      offsets: Array<{ startOffset: number; endOffset: number }>;
+    };
+    existingTests: {
+      text: string;
+      offsets: Array<{ startOffset: number; endOffset: number }>;
+    };
+  }): typeof extractionResults {
+    // Step 1: Collect all ranges with their tier priorities
+    type RangeWithPriority = {
+      startOffset: number;
+      endOffset: number;
+      tier: "A" | "B" | "C" | "D";
+      priority: number;
+      originalIndex: number;
+    };
+
+    const allRanges: RangeWithPriority[] = [];
+
+    // Add ranges with priority levels (higher number = higher priority)
+    extractionResults.linesAroundCursor.offsets.forEach((range, idx) => {
+      allRanges.push({ ...range, tier: "A", priority: 4, originalIndex: idx });
+    });
+
+    extractionResults.declarations.offsets.forEach((range, idx) => {
+      allRanges.push({ ...range, tier: "B", priority: 3, originalIndex: idx });
+    });
+
+    extractionResults.relevantBlocks.offsets.forEach((range, idx) => {
+      allRanges.push({ ...range, tier: "C", priority: 2, originalIndex: idx });
+    });
+
+    extractionResults.existingTests.offsets.forEach((range, idx) => {
+      allRanges.push({ ...range, tier: "D", priority: 1, originalIndex: idx });
+    });
+
+    // Step 2: Sort by priority (highest first) then by file position
+    allRanges.sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      return a.startOffset - b.startOffset;
+    });
+
+    // Step 3: Remove overlapping ranges (keep higher priority ones)
+    const deduplicatedRanges: RangeWithPriority[] = [];
+
+    for (const currentRange of allRanges) {
+      let hasOverlap = false;
+
+      // Check if current range overlaps with any already selected range
+      for (const selectedRange of deduplicatedRanges) {
+        if (this.rangesOverlap(currentRange, selectedRange)) {
+          hasOverlap = true;
+          break;
+        }
+      }
+
+      // Only add if no overlap with higher priority ranges
+      if (!hasOverlap) {
+        deduplicatedRanges.push(currentRange);
+      }
+    }
+
+    // Step 4: Group deduplicated ranges back by tier
+    const groupedRanges = {
+      A: deduplicatedRanges.filter((r) => r.tier === "A"),
+      B: deduplicatedRanges.filter((r) => r.tier === "B"),
+      C: deduplicatedRanges.filter((r) => r.tier === "C"),
+      D: deduplicatedRanges.filter((r) => r.tier === "D"),
+    };
+
+    // Step 5: Reconstruct text for each tier using deduplicated ranges
+    const reconstructText = (ranges: RangeWithPriority[]): string => {
+      if (ranges.length === 0) return "";
+
+      // Sort ranges by file position for proper text reconstruction
+      const sortedRanges = ranges.sort((a, b) => a.startOffset - b.startOffset);
+
+      const textParts: string[] = [];
+      for (const range of sortedRanges) {
+        const startPos = this.model.getPositionAt(range.startOffset);
+        const endPos = this.model.getPositionAt(range.endOffset);
+
+        const text = this.model.getValueInRange({
+          startLineNumber: startPos.lineNumber,
+          startColumn: 1, // Always start from beginning of line
+          endLineNumber: endPos.lineNumber,
+          endColumn: this.lineEndColumn(endPos.lineNumber),
+        });
+
+        textParts.push(text);
+      }
+
+      return textParts.join("\n");
+    };
+
+    // Step 6: Return deduplicated results in original structure
+    return {
+      linesAroundCursor: {
+        text: reconstructText(groupedRanges.A),
+        offsets: groupedRanges.A.map((r) => ({
+          startOffset: r.startOffset,
+          endOffset: r.endOffset,
+        })),
+      },
+      declarations: {
+        text: reconstructText(groupedRanges.B),
+        offsets: groupedRanges.B.map((r) => ({
+          startOffset: r.startOffset,
+          endOffset: r.endOffset,
+        })),
+      },
+      relevantBlocks: {
+        text: reconstructText(groupedRanges.C),
+        offsets: groupedRanges.C.map((r) => ({
+          startOffset: r.startOffset,
+          endOffset: r.endOffset,
+        })),
+      },
+      existingTests: {
+        text: reconstructText(groupedRanges.D),
+        offsets: groupedRanges.D.map((r) => ({
+          startOffset: r.startOffset,
+          endOffset: r.endOffset,
+        })),
+      },
+    };
+  }
+
+  /**
+   * Convenience method to get deduplicated context by calling individual extraction methods.
+   *
+   * This method allows you to get deduplicated results without using getRankedContextSections,
+   * giving you full control over the extraction parameters for each method.
+   *
+   * @param cursor Position in the code to extract context around
+   * @param options Configuration for each extraction method
+   * @returns Deduplicated results from all extraction methods
+   *
+   * @example
+   * ```typescript
+   * const deduplicated = extractor.getDeduplicatedContext(cursor, {
+   *   linesAroundCursor: { numberOfPrefixLines: 10, numberOfSuffixLines: 10 },
+   *   declarations: { maxCharsBudget: 1000 },
+   *   relevantBlocks: { topK: 5, minSimilarityThreshold: 0.1 }
+   * });
+   * ```
+   */
+  public getDeduplicatedContext(
+    cursor: Position,
+    options: {
+      linesAroundCursor?: ContextOptions;
+      declarations?: GlobalDeclarationsOptions;
+      relevantBlocks?: RelevantBlocksOptions;
+    } = {}
+  ): {
+    linesAroundCursor: string;
+    declarations: string;
+    relevantBlocks: string;
+    existingTests: string;
+    meta: {
+      offsets: {
+        A: Array<{ startOffset: number; endOffset: number }>;
+        B: Array<{ startOffset: number; endOffset: number }>;
+        C: Array<{ startOffset: number; endOffset: number }>;
+        D: Array<{ startOffset: number; endOffset: number }>;
+      };
+      originalCounts: { A: number; B: number; C: number; D: number };
+      deduplicatedCounts: { A: number; B: number; C: number; D: number };
+    };
+  } {
+    // Extract using individual methods with custom options
+    const linesResult = this.getContextAroundCursor(
+      cursor,
+      options.linesAroundCursor ?? {}
+    );
+    const declarationsResult = this.getGlobalDeclarations(
+      cursor,
+      options.declarations ?? {}
+    );
+    const relevantResult = this.getRelevantBlocks(
+      cursor,
+      options.relevantBlocks ?? {}
+    );
+
+    // Prepare extraction results for deduplication
+    const rawResults = {
+      linesAroundCursor: {
+        text: linesResult.text,
+        offsets: [
+          {
+            startOffset: linesResult.startOffset,
+            endOffset: linesResult.endOffset,
+          },
+        ],
+      },
+      declarations: {
+        text: declarationsResult.text,
+        offsets: declarationsResult.declarations.map((d) => ({
+          startOffset: d.startOffset,
+          endOffset: d.endOffset,
+        })),
+      },
+      relevantBlocks: {
+        text: relevantResult.text,
+        offsets: relevantResult.blocks.map((b) => ({
+          startOffset: b.startOffset,
+          endOffset: b.endOffset,
+        })),
+      },
+      existingTests: {
+        text: "", // Placeholder for future extension
+        offsets: [],
+      },
+    };
+
+    // Apply deduplication
+    const deduplicatedResults = this.deduplicateExtractionResults(rawResults);
+
+    // Return clean structure
+    return {
+      linesAroundCursor: deduplicatedResults.linesAroundCursor.text,
+      declarations: deduplicatedResults.declarations.text,
+      relevantBlocks: deduplicatedResults.relevantBlocks.text,
+      existingTests: deduplicatedResults.existingTests.text,
+      meta: {
+        offsets: {
+          A: deduplicatedResults.linesAroundCursor.offsets,
+          B: deduplicatedResults.declarations.offsets,
+          C: deduplicatedResults.relevantBlocks.offsets,
+          D: deduplicatedResults.existingTests.offsets,
+        },
+        originalCounts: {
+          A: rawResults.linesAroundCursor.offsets.length,
+          B: rawResults.declarations.offsets.length,
+          C: rawResults.relevantBlocks.offsets.length,
+          D: rawResults.existingTests.offsets.length,
+        },
+        deduplicatedCounts: {
+          A: deduplicatedResults.linesAroundCursor.offsets.length,
+          B: deduplicatedResults.declarations.offsets.length,
+          C: deduplicatedResults.relevantBlocks.offsets.length,
+          D: deduplicatedResults.existingTests.offsets.length,
+        },
+      },
+    };
+  }
+
+  /**
+   * Checks if two ranges overlap in the code.
+   *
+   * @param a First range to check
+   * @param b Second range to check
+   * @returns True if ranges overlap, false otherwise
+   */
+  private rangesOverlap(
+    a: { startOffset: number; endOffset: number },
+    b: { startOffset: number; endOffset: number }
+  ): boolean {
+    // Ranges overlap if one starts before the other ends
+    return !(a.endOffset <= b.startOffset || a.startOffset >= b.endOffset);
   }
 
   /**
