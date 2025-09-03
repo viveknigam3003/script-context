@@ -1,18 +1,36 @@
 /**
- * @fileoverview Context Extractor for JavaScript/TypeScript Code
+ * @fileoverview Clean and Modular Context Extractor for JavaScript/TypeScript Code
  *
  * This module provides intelligent context extraction from code using Tree-sitter AST parsing.
  * It extracts relevant code context around a cursor position for use with Large Language Models (LLMs).
  *
+ * Core Architecture:
+ * The module is built around three main extraction methods that can be used independently or combined:
+ *
+ * 1. **Lines Around Cursor** (`getContextAroundCursor`):
+ *    - Case (a): Cursor at top level - uses prefix/suffix lines with syntax sanity
+ *    - Case (b): Cursor inside block - takes entire block + prefix/suffix from boundaries
+ *
+ * 2. **Global Declarations** (`getGlobalDeclarations`):
+ *    - Priority 1: Declarations called/read in current block scope
+ *    - Priority 2: Most used declarations across the file
+ *    - Priority 3: Other available declarations if budget allows
+ *
+ * 3. **Relevant Blocks** (`getRelevantBlocks`):
+ *    - Tokenizes current block line by line with camelCase/snake_case conversion
+ *    - Uses Jaccard similarity to find top K most similar blocks
+ *    - Maintains original file order for output
+ *
  * Key Features:
- * - AST-aware context extraction
+ * - Clean, modular design with three independent extraction methods
+ * - AST-aware context extraction with syntax sanity preservation
  * - Incremental parsing for performance
- * - Multiple extraction strategies (function-based, block-based, line-based)
- * - Ranked context sections with dependency analysis
- * - Support for Postman test scripts
+ * - Budget management to stay within token limits
+ * - Support for Postman test scripts with pm.test() handling
+ * - Comprehensive tokenization with stopword filtering
  *
  * @author Vivek Nigam
- * @version 1.0.0
+ * @version 2.0.0
  */
 
 import type * as monaco from "monaco-editor";
@@ -343,74 +361,79 @@ type RankedBlock = BlockRange & {
   score: number;
 };
 
-/**
- * Types of top-level blocks for similarity and display
- */
-type TopBlockKind =
-  | "pm_test"
-  | "function_declaration"
-  | "arrow_function_decl" // const x = () => {}
-  | "function_expression_decl" // const x = function () {}
-  | "lexical_declaration" // const/let (non-fn)
-  | "variable_declaration"; // var (non-fn)
-
-/**
- * Top-level code block with categorization
- */
-type TopBlock = {
-  kind: TopBlockKind;
-  node: Node;
-  startOffset: number;
-  endOffset: number;
-};
-
 // ===== CONSTANTS =====
 
 /** Default percentage allocation for different context tiers */
 const DEFAULT_TIER_PERCENTS = { A: 0.4, B: 0.3, C: 0.2, D: 0.1 } as const;
 
-// Scoring weights - tunable via telemetry
-const W_LEX = 0.3; // Lexical proximity weight
-const W_REF = 0.35; // Reference/dependency weight (higher - dependencies matter)
-const W_KIND = 0.2; // Block type preference weight
-const W_COMP = -0.05; // Complexity penalty (negative for size penalty)
-const W_TITLE = 0.2; // Title/name overlap boost
-
 // ===== UTILITY FUNCTIONS =====
 
 /**
- * Clamps a value between 0 and 1
- */
-function clamp01(x: number): number {
-  return Math.max(0, Math.min(1, x));
-}
-
-/**
- * Splits camelCase and snake_case strings into individual words
+ * Splits camelCase and snake_case strings into individual words for tokenization.
+ *
+ * This function is essential for the tokenization strategy used in relevant blocks extraction.
+ * It converts complex identifiers into searchable tokens that can be matched across code.
+ *
+ * @param s String to split (e.g., "userName", "user_name", "validateZipCode")
+ * @returns Array of individual words in lowercase
+ *
+ * @example
+ * ```typescript
+ * splitCamelSnake("userName") // ["user", "Name"]
+ * splitCamelSnake("user_name") // ["user", "name"]
+ * splitCamelSnake("validateZipCode") // ["validate", "Zip", "Code"]
+ * splitCamelSnake("pm.response.json") // ["pm", "response", "json"]
+ * ```
  */
 function splitCamelSnake(s: string): string[] {
   return s
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_\W]+/g, " ")
-    .split(/\s+/)
-    .filter(Boolean);
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2") // Split camelCase: "userName" -> "user Name"
+    .replace(/[_\W]+/g, " ") // Replace underscores and non-word chars with spaces
+    .split(/\s+/) // Split on whitespace
+    .filter(Boolean); // Remove empty strings
 }
 
 /**
- * Tokenizes text, filters stopwords, and removes duplicates
+ * Tokenizes text into meaningful words, filters stopwords, and removes duplicates.
+ *
+ * This is the core tokenization function used throughout the context extraction process.
+ * It's designed specifically for code analysis, handling programming constructs intelligently.
+ *
+ * Process:
+ * 1. Converts to lowercase for case-insensitive matching
+ * 2. Splits camelCase and snake_case using splitCamelSnake()
+ * 3. Filters out single-character tokens (usually operators/punctuation)
+ * 4. Removes common code stopwords (if, for, const, etc.)
+ * 5. Deduplicates while preserving order
+ *
+ * @param raw Raw text to tokenize (code, comments, identifiers)
+ * @param STOP Set of stopwords to filter out (defaults to CODE_STOPWORDS)
+ * @returns Array of meaningful, deduplicated tokens
+ *
+ * @example
+ * ```typescript
+ * cutTokenize("const userName = pm.response.json().userName")
+ * // Returns: ["user", "name", "pm", "response", "json"]
+ *
+ * cutTokenize("pm.test('Check for response body schema', function() {")
+ * // Returns: ["pm", "test", "check", "response", "body", "schema", "function"]
+ * ```
  */
 function cutTokenize(
   raw: string,
   STOP: Set<string> = CODE_STOPWORDS
 ): string[] {
   if (!raw) return [];
+
   const out: string[] = [];
+  // Process each word through camelCase/snake_case splitting
   for (const w of splitCamelSnake(raw.toLowerCase())) {
-    if (w.length <= 1) continue;
-    if (STOP.has(w)) continue;
+    if (w.length <= 1) continue; // Skip single characters (operators, etc.)
+    if (STOP.has(w)) continue; // Skip common code keywords
     out.push(w);
   }
-  // Deduplicate while preserving order
+
+  // Deduplicate while preserving order for consistent results
   const seen = new Set<string>();
   const dedup: string[] = [];
   for (const t of out) {
@@ -423,35 +446,84 @@ function cutTokenize(
 }
 
 /**
- * Calculates Jaccard similarity between two sets
+ * Calculates Jaccard similarity coefficient between two sets of tokens.
+ *
+ * Jaccard similarity is the size of intersection divided by the size of union.
+ * It's perfect for measuring similarity between code blocks based on shared tokens.
+ *
+ * Formula: J(A,B) = |A ∩ B| / |A ∪ B|
+ *
+ * @param a First set of tokens
+ * @param b Second set of tokens
+ * @returns Similarity score between 0 and 1 (0 = no similarity, 1 = identical)
+ *
+ * @example
+ * ```typescript
+ * const tokens1 = new Set(["user", "name", "validate"]);
+ * const tokens2 = new Set(["user", "email", "validate"]);
+ * const similarity = jaccard(tokens1, tokens2); // 0.5 (2 common / 4 total)
+ * ```
  */
 function jaccard(a: Set<string>, b: Set<string>): number {
+  // Handle empty sets - no similarity if both empty
   if (!a.size && !b.size) return 0;
+
   let inter = 0;
-  // Iterate smaller set for performance
+  // Performance optimization: iterate over smaller set
   const small = a.size <= b.size ? a : b;
   const big = a.size <= b.size ? b : a;
+
+  // Count intersections
   small.forEach((t) => big.has(t) && inter++);
+
+  // Return Jaccard coefficient: |intersection| / |union|
   return inter / (a.size + b.size - inter);
 }
 
 // ===== MAIN CLASS =====
 
 /**
- * ContextExtractor provides intelligent code context extraction using Tree-sitter AST parsing.
+ * ContextExtractor provides intelligent, modular code context extraction using Tree-sitter AST parsing.
  *
- * Features:
- * - Incremental parsing for performance
- * - Multiple extraction strategies
- * - AST-aware context boundaries
- * - Dependency analysis and ranking
- * - Support for JavaScript/TypeScript and Postman test scripts
+ * This class offers three main extraction methods that can be used independently or combined:
  *
- * @example
+ * 1. **`getContextAroundCursor()`** - Extracts lines around cursor with syntax awareness
+ * 2. **`getGlobalDeclarations()`** - Extracts prioritized global declarations
+ * 3. **`getRelevantBlocks()`** - Extracts similar code blocks using token similarity
+ * 4. **`getRankedContextSections()`** - Combines all three methods with budget allocation
+ *
+ * Architecture Benefits:
+ * - **Modular**: Each method can be used independently
+ * - **Configurable**: Extensive options for customization
+ * - **Performant**: Incremental AST parsing with change tracking
+ * - **Scalable**: Easy to add or remove extraction strategies
+ * - **Type-safe**: Full TypeScript support with comprehensive interfaces
+ *
+ * @example Basic Usage
  * ```typescript
- * const extractor = await ContextExtractor.create(model);
- * const context = extractor.getContextAroundCursor({ lineNumber: 10, column: 5 });
- * console.log(context.text);
+ * const extractor = await ContextExtractor.create(monacoModel);
+ *
+ * // Extract lines around cursor
+ * const lines = extractor.getContextAroundCursor({ lineNumber: 42, column: 10 });
+ *
+ * // Extract global declarations
+ * const declarations = extractor.getGlobalDeclarations({ lineNumber: 42, column: 10 });
+ *
+ * // Extract similar blocks
+ * const similar = extractor.getRelevantBlocks({ lineNumber: 42, column: 10 });
+ *
+ * // Get comprehensive ranked context
+ * const ranked = extractor.getRankedContextSections({ lineNumber: 42, column: 10 });
+ * ```
+ *
+ * @example Advanced Configuration
+ * ```typescript
+ * const ranked = extractor.getRankedContextSections(cursor, {
+ *   maxCharsBudget: 8000,
+ *   tierPercents: { A: 0.5, B: 0.3, C: 0.2, D: 0.0 },
+ *   includeLeadingComments: true,
+ *   debug: true
+ * });
  * ```
  */
 export class ContextExtractor {
@@ -487,10 +559,6 @@ export class ContextExtractor {
 
   /** Debug information from the last context extraction operation */
   private _lastDebug: DebugInfo | null = null;
-
-  /** Reserved ranges to prevent overlap during ranked extraction */
-  private classRangeTaken: Array<{ startOffset: number; endOffset: number }> =
-    [];
 
   // ===== CONSTRUCTOR AND FACTORY =====
 
@@ -2125,49 +2193,6 @@ export class ContextExtractor {
     return null;
   }
 
-  /**
-   * Elevates a function node to a higher nesting level by traversing up the AST.
-   * Used for context expansion when we want broader scope than the immediate function.
-   * Safely limits elevation to prevent infinite traversal.
-   *
-   * @param funcNode Starting function node
-   * @param levels Number of function nesting levels to traverse upward
-   * @returns Elevated function node (or original if elevation not possible)
-   */
-  private elevateFunctionByLevels(funcNode: Node, levels: number): Node {
-    if (levels <= 0) return funcNode;
-    const safeLevels = Math.min(Math.max(levels, 0), 50);
-    let current: Node = funcNode;
-
-    for (let i = 0; i < safeLevels; i++) {
-      // Walk up until we find the *next* outer function-like ancestor
-      let p: Node | null = current.parent;
-      let promoted: Node | null = null;
-
-      while (p) {
-        if (this.isFunctionLike(p)) {
-          promoted = p;
-          break;
-        }
-        // Also handle being inside a function body on the path upwards
-        if (
-          this.isFunctionBody(p) &&
-          p.parent &&
-          this.isFunctionLike(p.parent)
-        ) {
-          promoted = p.parent;
-          break;
-        }
-        p = p.parent;
-      }
-
-      if (!promoted) break; // no more enclosing functions — stop early
-      current = promoted;
-    }
-
-    return current;
-  }
-
   /** Return the highest ancestor that is a direct child of the root (i.e., a top-level statement) */
   private topLevelAncestor(node: Node): Node | null {
     let cur: Node | null = node;
@@ -2344,53 +2369,6 @@ export class ContextExtractor {
   }
 
   /**
-   * Analyzes a node to find free identifiers (variables/functions used but not defined).
-   * This helps determine dependencies between code sections for context ranking.
-   * Collects identifiers that are read/called but excludes those defined within the node.
-   *
-   * @param node AST node to analyze
-   * @returns Set of free identifier names
-   */
-  private freeIdentifiersOf(node: Node): Set<string> {
-    const reads = new Set<string>();
-    const defs = new Set<string>();
-
-    // collect defs inside the node (function names, declarators)
-    const collectDefs = (n: Node) => {
-      if (n.type === "function_declaration") {
-        const nm = n.childForFieldName("name")?.text;
-        if (nm) defs.add(nm);
-      } else if (n.type === "variable_declarator") {
-        const id = n.childForFieldName("name");
-        if (id?.type === "identifier" && id.text) defs.add(id.text);
-      }
-      for (let i = 0; i < n.namedChildCount; i++) collectDefs(n.namedChild(i)!);
-    };
-
-    const collectReads = (n: Node) => {
-      if (n.type === "identifier") {
-        const parent = n.parent;
-        const name = n.text;
-        const isDefSite =
-          (parent?.type === "variable_declarator" &&
-            parent.firstNamedChild === n) ||
-          (parent?.type === "function_declaration" &&
-            parent.childForFieldName("name") === n);
-        if (!isDefSite && name) reads.add(name);
-      }
-      for (let i = 0; i < n.namedChildCount; i++)
-        collectReads(n.namedChild(i)!);
-    };
-
-    collectDefs(node);
-    collectReads(node);
-
-    // free = reads \ defs
-    defs.forEach((d) => reads.delete(d));
-    return reads;
-  }
-
-  /**
    * Analyzes identifier usage frequency across the entire file.
    * Returns a map of identifier names to their usage count.
    *
@@ -2489,183 +2467,7 @@ export class ContextExtractor {
     return usedIdentifiers;
   }
 
-  /**
-   * Builds an index mapping global identifier names to their defining block ranges.
-   * This enables quick lookup of where variables and functions are defined
-   * for dependency resolution during context extraction.
-   *
-   * @returns Map from identifier name to its defining BlockRange
-   */
-  private buildGlobalIndex(): Map<string, BlockRange> {
-    const map = new Map<string, BlockRange>();
-    const globals = this.collectGlobalBlockCandidates();
-    for (const g of globals) {
-      // function_declaration: take its name
-      if (g.node.type === "function_declaration") {
-        const nm = g.node.childForFieldName("name")?.text;
-        if (nm) map.set(nm, g);
-      }
-      // lexical/variable declarations (simple id = ...)
-      if (
-        g.node.type === "lexical_declaration" ||
-        g.node.type === "variable_declaration"
-      ) {
-        const visit = (n: Node) => {
-          if (n.type === "variable_declarator") {
-            const id = n.childForFieldName("name");
-            if (id?.type === "identifier" && id.text) {
-              map.set(id.text, g);
-            }
-          }
-          for (let i = 0; i < n.namedChildCount; i++) visit(n.namedChild(i)!);
-        };
-        visit(g.node);
-      }
-    }
-    return map;
-  }
-
-  /**
-   * Expands selected blocks by including their dependencies (one-hop resolution).
-   * Analyzes free identifiers in picked blocks and adds global definitions they reference.
-   * Respects budget constraints to avoid including too much context.
-   *
-   * @param picked Currently selected block ranges
-   * @param globalIndex Map of identifier names to their defining blocks
-   * @param already Ranges already included in the context
-   * @param budgetLeft Remaining character budget for additional context
-   * @returns Expanded array of ranges including dependencies
-   */
-  private expandWithDependencies(
-    picked: BlockRange[],
-    globalIndex: Map<string, BlockRange>,
-    already: Array<{ startOffset: number; endOffset: number }>,
-    budgetLeft: number
-  ): Array<{ startOffset: number; endOffset: number }> {
-    const out = [...already];
-    const seen = new Set(out.map((r) => `${r.startOffset}:${r.endOffset}`));
-
-    const tryAdd = (br: BlockRange) => {
-      const key = `${br.startOffset}:${br.endOffset}`;
-      if (seen.has(key)) return false;
-      const sz = br.endOffset - br.startOffset;
-      if (sz <= 0 || sz > budgetLeft) return false;
-      out.push({ startOffset: br.startOffset, endOffset: br.endOffset });
-      budgetLeft -= sz;
-      seen.add(key);
-      return true;
-    };
-
-    for (const b of picked) {
-      const free = this.freeIdentifiersOf(b.node);
-      for (const name of free) {
-        const dep = globalIndex.get(name);
-        if (dep) tryAdd(dep);
-      }
-    }
-    return out;
-  }
-
   // Ranking
-
-  // Collect plain identifier names used inside a range (reads + calls) using POSITION overlap
-  private collectIdentifiersInRange(startOffset: number, endOffset: number) {
-    if (!this.tree)
-      return { reads: new Set<string>(), calls: new Set<string>() };
-
-    const rangeStartPos = this.model.getPositionAt(startOffset);
-    const rangeEndPos = this.model.getPositionAt(endOffset);
-
-    // Helper: node is outside [rangeStartPos, rangeEndPos] ?
-    const outsideByPos = (n: Node) =>
-      n.endPosition.row < rangeStartPos.lineNumber - 1 ||
-      n.startPosition.row > rangeEndPos.lineNumber - 1;
-
-    const reads = new Set<string>();
-    const calls = new Set<string>();
-
-    const walk = (n: Node) => {
-      if (outsideByPos(n)) return;
-
-      if (n.type === "identifier") {
-        const parent = n.parent;
-        // name via positions (safe for any encoding)
-        const name = this.model.getValueInRange({
-          startLineNumber: n.startPosition.row + 1,
-          startColumn: n.startPosition.column + 1,
-          endLineNumber: n.endPosition.row + 1,
-          endColumn: n.endPosition.column + 1,
-        });
-
-        // treat as read unless it's the defining id of a declarator or function name
-        const isDef =
-          (parent?.type === "variable_declarator" &&
-            parent.firstNamedChild === n) ||
-          (parent?.type === "function_declaration" &&
-            parent.firstNamedChild === n);
-
-        if (!isDef && name) reads.add(name);
-
-        // If parent is call_expression and this id is the callee, mark a call
-        if (
-          parent?.type === "call_expression" &&
-          parent.child(0) === n &&
-          name
-        ) {
-          calls.add(name);
-        }
-      }
-
-      for (let i = 0; i < n.namedChildCount; i++) walk(n.namedChild(i)!);
-    };
-
-    walk(this.tree.rootNode);
-    return { reads, calls };
-  }
-
-  /**
-   * Collects all definitions (function names, variable names) exported by a block.
-   * This helps identify what symbols a block makes available to other code.
-   * Used for dependency analysis and avoiding duplicate definitions.
-   *
-   * @param n Block node to analyze for definitions
-   * @returns Set of identifier names defined by this block
-   */
-  private collectDefsForBlock(n: Node): Set<string> {
-    const defs = new Set<string>();
-    const add = (name?: string | null) => {
-      if (name) defs.add(name);
-    };
-
-    // function declaration
-    if (n.type === "function_declaration") {
-      add(n.childForFieldName("name")?.text);
-      return defs;
-    }
-
-    // call_expression / expression_statement contain no direct defs
-    if (n.type === "call_expression" || n.type === "expression_statement") {
-      return defs;
-    }
-
-    // lexical/variable declarations
-    const visit = (node: Node) => {
-      if (node.type === "variable_declarator") {
-        // id can be identifier or pattern; we only support simple for now
-        const id = node.childForFieldName("name");
-        if (id?.type === "identifier") add(id.text);
-      }
-      for (let i = 0; i < node.namedChildCount; i++) visit(node.namedChild(i)!);
-    };
-
-    if (n.type === "lexical_declaration" || n.type === "variable_declaration") {
-      visit(n);
-      return defs;
-    }
-
-    // method/class names are rarely globals in Postman tests; skip for brevity
-    return defs;
-  }
 
   // Top-level globals: const/let/var + function declarations (exclude Tier A block later)
   private collectGlobalBlockCandidates(): BlockRange[] {
@@ -2699,211 +2501,6 @@ export class ContextExtractor {
       }
     }
     return out;
-  }
-
-  /**
-   * Collects pm.test() call blocks excluding a specific range (usually Tier A).
-   * Searches for test blocks in the global scope and returns them with metadata.
-   * These form Tier B context in the ranking system.
-   *
-   * @param excludeRange Optional range to exclude from results (e.g., current context)
-   * @returns Array of test block ranges with their AST nodes
-   */
-  private collectOtherTestBlocks(excludeRange?: {
-    startOffset: number;
-    endOffset: number;
-  }): BlockRange[] {
-    if (!this.tree) return [];
-    const out: BlockRange[] = [];
-    const root = this.tree.rootNode;
-
-    for (let i = 0; i < root.namedChildCount; i++) {
-      const st = root.namedChild(i)!;
-      // either expression_statement→call_expression or direct call_expression
-      let call: Node | null = null;
-      if (
-        st.type === "expression_statement" &&
-        st.namedChildCount === 1 &&
-        st.namedChildren[0]?.type === "call_expression"
-      ) {
-        call = st.namedChildren[0];
-      } else if (st.type === "call_expression") {
-        call = st;
-      }
-      if (!call) continue;
-
-      // is pm.test(...) ? (best-effort: callee is member_expression with object 'pm' and property 'test')
-      const callee = call.child(0);
-      if (callee?.type === "member_expression") {
-        const obj = callee.child(0);
-        const prop = callee.child(2); // object '.' property
-        const isPmTest =
-          obj?.type === "identifier" &&
-          obj.text === "pm" &&
-          prop?.text === "test";
-        if (!isPmTest) continue;
-      } else {
-        continue;
-      }
-
-      const container = call; // we already prefer call expression container for tests
-      const { startOffset, endOffset } =
-        this.expandNodeToFullLinesWithLeadingComments(container);
-
-      // exclude Tier A
-      if (
-        excludeRange &&
-        !(
-          endOffset <= excludeRange.startOffset ||
-          startOffset >= excludeRange.endOffset
-        )
-      ) {
-        continue;
-      }
-      out.push({ startOffset, endOffset, node: container, kind: "pm_test" });
-    }
-
-    return out;
-  }
-
-  private lineNumberAtOffset(off: number): number {
-    return this.model.getPositionAt(off).lineNumber;
-  }
-
-  private scoreCandidates(
-    candidates: BlockRange[],
-    tierA: { startOffset: number; endOffset: number; text: string },
-    cursor: Position,
-    tierBudgetChars: number,
-    titleTokens: string[]
-  ): RankedBlock[] {
-    // Build read/call sets from Tier A to estimate dependency likelihood
-    const { reads, calls } = this.collectIdentifiersInRange(
-      tierA.startOffset,
-      tierA.endOffset
-    );
-
-    const cursorLine = cursor.lineNumber;
-
-    const ranked: RankedBlock[] = candidates.map((c) => {
-      const size = Math.max(0, c.endOffset - c.startOffset);
-
-      // S_lexical: distance in lines from cursor → normalize to [0..1] (closer is better)
-      const startLine = this.lineNumberAtOffset(c.startOffset);
-      const dist = Math.abs(startLine - cursorLine);
-      const S_lex = clamp01(1 - dist / 200); // 200-line decay horizon
-
-      // S_ref: defs ∩ (reads ∪ calls) with a tiny sigmoid
-      const defs = this.collectDefsForBlock(c.node);
-      let matches = 0;
-      defs.forEach((d) => {
-        if (reads.has(d) || calls.has(d)) matches++;
-      });
-      const S_ref = clamp01(1 - Math.exp(-matches)); // 0→0, 1→~0.63, 2→~0.86, 3→~0.95
-
-      // S_kind: priors (globals/tests favored)
-      let S_kind = 0.5;
-      switch (c.kind) {
-        case "function_declaration":
-          S_kind = 1.0;
-          break;
-        case "lexical_declaration":
-          S_kind = 0.9;
-          break;
-        case "variable_declaration":
-          S_kind = 0.8;
-          break;
-        case "pm_test":
-          S_kind = 0.7;
-          break;
-        default:
-          S_kind = 0.6;
-          break;
-      }
-
-      let titleOverlap = 0;
-      const nameCandidates: string[] = [];
-
-      if (c.node.type === "function_declaration") {
-        const nm = c.node.childForFieldName("name")?.text;
-        if (nm) nameCandidates.push(nm);
-      } else if (c.kind === "pm_test") {
-        const t = this.getTestTitleFromNode(c.node);
-        if (t) nameCandidates.push(...cutTokenize(t)); // <-- add this
-      } else {
-        const defs = this.collectDefsForBlock(c.node);
-        defs.forEach((d) => nameCandidates.push(d));
-      }
-
-      // also look at first few reads inside the node
-      const free = this.freeIdentifiersOf(c.node);
-      for (const id of Array.from(free).slice(0, 5)) nameCandidates.push(id);
-
-      const names = nameCandidates.map((s) => s.toLowerCase());
-      for (const t of titleTokens) {
-        if (names.some((nm) => nm.includes(t))) titleOverlap++;
-      }
-      const S_title = clamp01(titleOverlap / Math.max(1, titleTokens.length));
-
-      // S_complexity: relative to tier budget (char heuristic)
-      const S_comp = clamp01(size / Math.max(1, tierBudgetChars));
-
-      const score =
-        W_LEX * S_lex +
-        W_REF * S_ref +
-        W_KIND * S_kind +
-        W_COMP * S_comp +
-        W_TITLE * S_title;
-
-      return {
-        ...c,
-        sizeChars: size,
-        signals: {
-          lexical: S_lex,
-          reference: S_ref,
-          kind: S_kind,
-          complexity: S_comp,
-        },
-        score,
-      };
-    });
-
-    // Higher score first; break ties by smaller size
-    ranked.sort((a, b) => b.score - a.score || a.sizeChars - b.sizeChars);
-    return ranked;
-  }
-
-  private selectWithinBudget<
-    T extends { startOffset: number; endOffset: number }
-  >(items: T[], maxChars: number): T[] {
-    const out: T[] = [];
-    let used = 0;
-    for (const it of items) {
-      const sz = it.endOffset - it.startOffset;
-      if (sz <= 0) continue;
-      if (used + sz > maxChars) continue; // never cut — skip
-      out.push(it);
-      used += sz;
-    }
-    return out;
-  }
-
-  /**
-   * Creates a compact skeleton representation of a pm.test() call.
-   * Useful for displaying test structure without full implementation details.
-   * Extracts the test name from the first argument and shows simplified syntax.
-   *
-   * @param node AST node representing a pm.test() call
-   * @returns Skeleton string like 'pm.test("testname", function () { ... });'
-   */
-  private renderTestSkeleton(node: Node): string {
-    // try to pull the test name: pm.test("Name", ...)
-    const arg0 = node.childForFieldName("arguments")?.namedChildren?.[0];
-    const lit =
-      arg0 && (arg0.type === "string" || arg0.type === "template_string")
-        ? arg0.text
-        : '"test"';
-    return `pm.test(${lit}, function () { ... });`;
   }
 
   /**
@@ -3013,388 +2610,54 @@ export class ContextExtractor {
   }
 
   /**
-   * Extracts name and comment tokens from a node for similarity analysis.
-   * Gets function/variable names and leading comment text to build semantic tokens.
-   * Used for ranking code sections based on textual similarity.
+   * Extracts comprehensive ranked context sections by combining all three main extraction methods.
    *
-   * @param n AST node to extract tokens from
-   * @returns Array of name and comment tokens
-   */
-  private getNameAndLeadingCommentTokens(n: Node): string[] {
-    const names: string[] = [];
-
-    // 1) Function / variable name
-    if (n.type === "function_declaration") {
-      const nm = n.childForFieldName("name")?.text ?? "";
-      if (nm) names.push(nm);
-    } else if (
-      n.type === "lexical_declaration" ||
-      n.type === "variable_declaration"
-    ) {
-      // first identifier on the LHS
-      let firstId = "";
-      const walk = (node: Node) => {
-        if (firstId) return;
-        if (node.type === "identifier") {
-          firstId = node.text ?? "";
-          return;
-        }
-        for (let i = 0; i < node.namedChildCount; i++)
-          walk(node.namedChild(i)!);
-      };
-      walk(n);
-      if (firstId) names.push(firstId);
-    }
-
-    // 2) Leading comment text
-    const startLine = n.startPosition.row + 1;
-    const cmt = this.leadingCommentTextAt(startLine);
-
-    // 3) A few body identifiers + string literal words (bounded for latency)
-    const bodyTokens: string[] = [];
-    const limitIds = 20; // small cap to keep this O(1)
-    let seen = 0;
-
-    const collectBody = (node: Node) => {
-      if (seen >= limitIds) return;
-
-      if (node.type === "identifier") {
-        const txt = node.text ?? "";
-        if (txt) {
-          bodyTokens.push(txt);
-          seen++;
-        }
-      } else if (node.type === "string" || node.type === "template_string") {
-        // pull words from literals to help with semantics like "schema", "valid", etc.
-        const raw = this.model.getValueInRange({
-          startLineNumber: node.startPosition.row + 1,
-          startColumn: node.startPosition.column + 1,
-          endLineNumber: node.endPosition.row + 1,
-          endColumn: node.endPosition.column + 1,
-        });
-        bodyTokens.push(
-          ...splitCamelSnake(raw.replace(/^['"`]/, "").replace(/['"`]$/, ""))
-        );
-      }
-
-      for (let i = 0; i < node.namedChildCount && seen < limitIds; i++) {
-        collectBody(node.namedChild(i)!);
-      }
-    };
-
-    // walk the node to sample tokens
-    collectBody(n);
-
-    // tokenize + stopword filter
-    return [
-      ...cutTokenize(names.join(" ")),
-      ...cutTokenize(cmt),
-      ...cutTokenize(bodyTokens.join(" ")),
-    ];
-  }
-
-  /**
-   * @deprecated Will be removed in next iteration
-   * Calculates similarity score between query tokens and a node's content.
-   * Uses Jaccard similarity with small bonuses for exact token matches.
+   * This method provides a clean, modular approach to context extraction by orchestrating
+   * the three core methods with intelligent budget allocation:
    *
-   * @param queryTokens Tokens from the query context
-   * @param n Node to score for similarity
-   * @returns Similarity score between 0 and 1
-   */
-  // @ts-expect-error - Will be removed in next iteration
-  private scoreHelperSimilarity(queryTokens: string[], n: Node): number {
-    const q = new Set(queryTokens);
-    const cands = new Set(this.getNameAndLeadingCommentTokens(n));
-    const base = jaccard(q, cands); // 0..1
-    // tiny bonus if any exact name token overlaps a query token
-    let exact = 0;
-    cands.forEach((t) => {
-      if (q.has(t)) exact++;
-    });
-    const exactBoost = Math.min(0.15, exact * 0.03);
-    // tiny bonus if helper mentions any free identifier from Tier A
-    // (we’ll pass freeA externally to avoid re-traversal)
-    return Math.min(1, base + exactBoost);
-  }
-
-  /**
-   * Collects all top-level blocks in the file that are candidates for context extraction.
-   * Includes functions, pm.test() calls, variable declarations, and other statements.
-   * Categorizes each block by type for different ranking strategies.
+   * **Tier Allocation (Default: A=40%, B=30%, C=20%, D=10%)**:
+   * - **Tier A**: Lines around cursor using `getContextAroundCursor()`
+   * - **Tier B**: Global declarations using `getGlobalDeclarations()`
+   * - **Tier C**: Relevant blocks using `getRelevantBlocks()`
+   * - **Tier D**: Existing tests (placeholder for future extension)
    *
-   * @returns Array of top-level blocks with their types and ranges
-   */
-  private collectTopLevelBlocks(): TopBlock[] {
-    if (!this.tree) return [];
-    const root = this.tree.rootNode;
-    const blocks: TopBlock[] = [];
-
-    const push = (node: Node, kind: TopBlockKind) => {
-      const { startOffset, endOffset } =
-        this.expandNodeToFullLinesWithLeadingComments(node);
-      blocks.push({ kind, node, startOffset, endOffset });
-    };
-
-    for (let i = 0; i < root.namedChildCount; i++) {
-      const st = root.namedChild(i)!;
-
-      // pm.test(...) as expression or direct call
-      const asCall =
-        st.type === "expression_statement" ? st.namedChildren[0] : st;
-      if (asCall?.type === "call_expression") {
-        const callee = asCall.child(0);
-        if (callee?.type === "member_expression") {
-          const obj = callee.child(0);
-          const prop = callee.child(2);
-          if (
-            obj?.type === "identifier" &&
-            obj.text === "pm" &&
-            prop?.text === "test"
-          ) {
-            push(asCall, "pm_test");
-            continue;
-          }
-        }
-      }
-
-      // function declaration
-      if (st.type === "function_declaration") {
-        push(st, "function_declaration");
-        continue;
-      }
-
-      // const/let/var (detect arrow/function initializer vs plain decl)
-      if (
-        st.type === "lexical_declaration" ||
-        st.type === "variable_declaration"
-      ) {
-        let hasArrow = false;
-        let hasFuncExpr = false;
-        const walk = (n: Node) => {
-          if (n.type === "arrow_function") hasArrow = true;
-          if (n.type === "function_expression" || n.type === "function")
-            hasFuncExpr = true;
-          for (let j = 0; j < n.namedChildCount; j++) walk(n.namedChild(j)!);
-        };
-        walk(st);
-        if (hasArrow) push(st, "arrow_function_decl");
-        else if (hasFuncExpr) push(st, "function_expression_decl");
-        else push(st, st.type as TopBlockKind);
-        continue;
-      }
-    }
-
-    blocks.sort((a, b) => a.startOffset - b.startOffset);
-    return blocks;
-  }
-
-  // Get the visible text for a range
-  private textForRange(startOffset: number, endOffset: number): string {
-    return this.model.getValueInRange({
-      startLineNumber: this.model.getPositionAt(startOffset).lineNumber,
-      startColumn: 1,
-      endLineNumber: this.model.getPositionAt(endOffset).lineNumber,
-      endColumn: this.lineEndColumnAtOffset(endOffset),
-    });
-  }
-
-  // Build cut tokens for a top-level block: leading comment + pm.test title + body
-  // Build cut tokens for a top-level block: leading comment + name/ids + (pm.test title)
-  private tokensForTopBlock(b: TopBlock): string[] {
-    const base = this.getNameAndLeadingCommentTokens(b.node); // names + leading comment + sampled body ids
-    let titleTokens: string[] = [];
-
-    if (b.kind === "pm_test") {
-      const args = b.node.childForFieldName("arguments");
-      const a0 = args?.namedChildren?.[0];
-      if (a0 && (a0.type === "string" || a0.type === "template_string")) {
-        const title = a0.text.replace(/^['"`]/, "").replace(/['"`]$/, "");
-        titleTokens = cutTokenize(title);
-      }
-    }
-
-    // de-dupe while preserving order
-    const seen = new Set<string>();
-    const all = [...base, ...titleTokens];
-    const out: string[] = [];
-    for (const t of all)
-      if (!seen.has(t)) {
-        seen.add(t);
-        out.push(t);
-      }
-    return out;
-  }
-
-  // Tokens around the current edit: nearest function (with leading comment) else current line + its comment
-  /**
-   * Extracts tokens from the current editing context for similarity analysis.
-   * If cursor is inside a function, extracts tokens from the entire function.
-   * Otherwise, falls back to current line and associated comments.
-   *
-   * @param cursor Current cursor position
-   * @returns Object with tokens array and the range they represent
-   */
-  private tokensForCurrentEdit(cursor: Position): {
-    tokens: string[];
-    range: { startOffset: number; endOffset: number };
-  } {
-    if (!this.tree)
-      return { tokens: [], range: { startOffset: 0, endOffset: 0 } };
-
-    const pos: Point = {
-      row: cursor.lineNumber - 1,
-      column: cursor.column - 1,
-    };
-    const nodeAt = this.tree.rootNode.descendantForPosition(pos);
-
-    const isFn = (n: Node | null) =>
-      !!n &&
-      (n.type === "function_declaration" ||
-        n.type === "function_expression" ||
-        n.type === "arrow_function" ||
-        n.type === "method_definition" ||
-        n.type === "function");
-
-    let fn: Node | null = nodeAt;
-    while (fn && !isFn(fn)) fn = fn.parent;
-
-    if (fn) {
-      const { startOffset, endOffset } =
-        this.expandNodeToFullLinesWithLeadingComments(fn);
-      const cmt = this.leadingCommentTextAt(fn.startPosition.row + 1);
-      const body = this.textForRange(startOffset, endOffset);
-      return {
-        tokens: cutTokenize([cmt, body].join(" \n ")),
-        range: { startOffset, endOffset },
-      };
-    }
-
-    const lineText = this.getLineText(cursor.lineNumber);
-    const cmt = this.leadingCommentTextAt(cursor.lineNumber);
-    const startOffset = this.model.getOffsetAt({
-      lineNumber: cursor.lineNumber,
-      column: 1,
-    });
-    const endOffset = this.model.getOffsetAt({
-      lineNumber: cursor.lineNumber,
-      column: this.lineEndColumn(cursor.lineNumber),
-    });
-    return {
-      tokens: cutTokenize([cmt, lineText].join(" \n ")),
-      range: { startOffset, endOffset },
-    };
-  }
-
-  // Rank *all* other top-level blocks by Jaccard to current edit; return top K (no overlap with current)
-  // Return ALL scored blocks; let caller filter and slice
-  private rankSimilarTopBlocks(
-    cursor: Position
-  ): Array<{ block: TopBlock; score: number }> {
-    const all = this.collectTopLevelBlocks();
-    const { tokens: qTokens, range: qRange } =
-      this.tokensForCurrentEdit(cursor);
-    const qSet = new Set(qTokens);
-
-    const scored = all
-      .filter(
-        (b) =>
-          b.endOffset <= qRange.startOffset || b.startOffset >= qRange.endOffset
-      )
-      .map((b) => {
-        const tks = this.tokensForTopBlock(b);
-        const score = jaccard(qSet, new Set(tks));
-        return { block: b, score };
-      });
-
-    // Prefer higher similarity, then closer to cursor
-    const lineAt = (off: number) => this.model.getPositionAt(off).lineNumber;
-    scored.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      const da = Math.abs(lineAt(a.block.startOffset) - cursor.lineNumber);
-      const db = Math.abs(lineAt(b.block.startOffset) - cursor.lineNumber);
-      return da - db;
-    });
-
-    return scored;
-  }
-
-  private keyOf(r: { startOffset: number; endOffset: number }) {
-    return `${r.startOffset}:${r.endOffset}`;
-  }
-  private overlaps(
-    a: { startOffset: number; endOffset: number },
-    b: { startOffset: number; endOffset: number }
-  ) {
-    return !(a.endOffset <= b.startOffset || a.startOffset >= b.endOffset);
-  }
-  /**
-   * Filters items to exclude those that overlap with already taken ranges.
-   * Used to prevent duplicate context extraction and ensure clean tier separation.
-   *
-   * @param items Array of items to filter
-   * @param taken Array of already allocated ranges
-   * @returns Filtered array with non-overlapping items only
-   */
-  private filterNonOverlapping<
-    T extends { startOffset: number; endOffset: number }
-  >(items: T[], taken: Array<{ startOffset: number; endOffset: number }>) {
-    return items.filter((it) => !taken.some((t) => this.overlaps(it, t)));
-  }
-
-  /**
-   * Reserves ranges to prevent overlap during ranked extraction
-   * @param ranges Array of ranges to reserve
-   */
-  private reserveRanges(
-    ranges: Array<{ startOffset: number; endOffset: number }>
-  ) {
-    for (const r of ranges)
-      this.classRangeTaken.push({
-        startOffset: r.startOffset,
-        endOffset: r.endOffset,
-      });
-  }
-
-  private resetRangeReservations() {
-    this.classRangeTaken = [];
-  }
-
-  /**
-   * Extracts ranked context sections organized into multiple tiers based on relevance.
-   *
-   * This advanced method provides a multi-tier context extraction system:
-   * - Tier A (40%): Local context around cursor (current function/block)
-   * - Tier B (30%): Global declarations and dependencies
-   * - Tier C (20%): Relevant helper functions and utilities
-   * - Tier D (10%): Other test blocks and compact skeletons
-   *
-   * Features:
-   * - Smart dependency analysis and one-hop expansion
-   * - Similarity-based ranking using Jaccard coefficients
-   * - Budget management to stay within token limits
-   * - Overlap prevention between tiers
-   * - Rich debug information for analysis
+   * **Key Benefits**:
+   * - **Modular Design**: Each tier uses a dedicated, well-tested method
+   * - **Budget Management**: Intelligent character allocation across tiers
+   * - **Independent Methods**: Each extraction method can be used standalone
+   * - **Configurable**: Extensive options for customization
+   * - **Extensible**: Easy to modify tier allocation or add new tiers
    *
    * @param cursor Position in the code to extract context around
-   * @param opts Configuration options including debug flag and tier percentages
-   * @returns Ranked context sections with metadata and optional debug info
+   * @param opts Configuration options for budget, tiers, and debug information
+   * @returns Comprehensive context sections with metadata and optional debug info
    *
-   * @example
+   * @example Basic Usage
    * ```typescript
    * const ranked = extractor.getRankedContextSections(
    *   { lineNumber: 42, column: 10 },
-   *   { debug: true, maxCharsBudget: 12000 }
+   *   { maxCharsBudget: 8000 }
    * );
    *
-   * console.log('Tier A (Local):', ranked.linesAroundCursor);
-   * console.log('Tier B (Globals):', ranked.declarations);
-   * console.log('Tier C (Helpers):', ranked.relevantLines);
-   * console.log('Tier D (Tests):', ranked.existingTests);
+   * console.log('Lines around cursor:', ranked.linesAroundCursor);
+   * console.log('Global declarations:', ranked.declarations);
+   * console.log('Relevant blocks:', ranked.relevantLines);
+   * ```
+   *
+   * @example Advanced Configuration
+   * ```typescript
+   * const ranked = extractor.getRankedContextSections(cursor, {
+   *   maxCharsBudget: 12000,
+   *   tierPercents: { A: 0.5, B: 0.3, C: 0.2, D: 0.0 }, // Custom allocation
+   *   rawPrefixLines: 10,
+   *   rawSuffixLines: 10,
+   *   includeLeadingComments: true,
+   *   debug: true
+   * });
    *
    * if (ranked.debug) {
    *   console.log('Budget allocation:', ranked.debug.budgets);
-   *   console.log('Scoring details:', ranked.debug.scored);
+   *   console.log('Title tokens:', ranked.debug.titleTokens);
    * }
    * ```
    */
@@ -3402,12 +2665,12 @@ export class ContextExtractor {
     cursor: Position,
     opts: RankedSectionsOptions = {}
   ): ExtractRankedContextSections {
-    this.resetRangeReservations();
-
+    // Step 1: Calculate budget allocation for each tier based on percentages
     const totalBudget = Math.max(1000, opts.maxCharsBudget ?? 8000);
     const percents = opts.tierPercents ?? DEFAULT_TIER_PERCENTS;
     const budgets = this.deriveBudgets(totalBudget, percents);
 
+    // Step 2: Initialize debug information structure for optional debugging
     const debug: DebugInfo = {
       titleTokens: [],
       queryTokens: [],
@@ -3418,197 +2681,113 @@ export class ContextExtractor {
       depsAdded: [],
     };
 
-    // ---- Tier A (always exactly one slice) ----
-    const tierA = this.getContextAroundCursor(cursor, {
-      ...opts,
-      rawPrefixLines: opts.rawPrefixLines ?? 5, // tune as you like
-      rawSuffixLines: opts.rawSuffixLines ?? 5,
-      maxCharsBudget: undefined, // irrelevant for raw lines
-    });
-    const baseRange = {
-      startOffset: tierA.startOffset,
-      endOffset: tierA.endOffset,
-    };
-    const linesAroundCursorRanges = [baseRange];
-    this.reserveRanges(linesAroundCursorRanges); // reserve A
-
-    // Title / query tokens
-    const nodeAtCursor = this.tree!.rootNode.descendantForPosition({
-      row: cursor.lineNumber - 1,
-      column: cursor.column - 1,
-    });
-    const aFunc = nodeAtCursor ? this.nearestFunctionFrom(nodeAtCursor) : null;
-    const aContainer = aFunc ? this.wrapFunctionIfArgument(aFunc) : null;
-    const title = aContainer ? this.getTestTitleFromNode(aContainer) : null;
-    const titleTokens = this.tokenize(title);
-    const queryTokens = this.buildQueryTokens(cursor);
-    debug.titleTokens = titleTokens;
-    debug.queryTokens = queryTokens;
-
-    // Globals index (for later dep-closure)
-    const globalIndex = this.buildGlobalIndex();
-
-    // ---- Tier B: Declarations (NO overlap with A) ----
-    const declOnly = this.collectGlobalBlockCandidates()
-      .filter((b) => b.kind === "declaration")
-      .filter(
-        (b) =>
-          b.endOffset <= baseRange.startOffset ||
-          b.startOffset >= baseRange.endOffset
-      );
-
-    const rankedB = this.scoreCandidates(
-      declOnly,
-      { ...baseRange, text: tierA.text },
-      cursor,
-      budgets.B,
-      titleTokens
-    );
-    debug.scored.B = rankedB;
-
-    // ensure disjointness w/ A (already filtered) and within budget
-    const pickedB = this.selectWithinBudget(
-      this.filterNonOverlapping(rankedB, this.classRangeTaken),
-      budgets.B
-    );
-    debug.picked.B = pickedB;
-    const pickedBKeys = new Set(pickedB.map((b) => this.keyOf(b)));
-    for (const r of rankedB)
-      if (!pickedBKeys.has(this.keyOf(r)))
-        debug.skipped.B.push({ block: r, reason: "over_budget" });
-    this.reserveRanges(pickedB); // reserve B
-
-    // ---- Tier C: Relevant helpers (cut-token similarity) ----
-    const TOP_K = 3;
-
-    // exclude Tier A range, all non-function declarations, and all pm.tests
-    const testsAll = this.collectOtherTestBlocks();
-    const excludeRanges = [baseRange, ...declOnly, ...testsAll];
-
-    const overlapsExcluded = (r: { startOffset: number; endOffset: number }) =>
-      excludeRanges.some(
-        (ex) =>
-          !(r.endOffset <= ex.startOffset || r.startOffset >= ex.endOffset)
-      );
-
-    // use the full ranked list; keep only helper functions
-    const similarAll = this.rankSimilarTopBlocks(cursor)
-      .filter(
-        (s) =>
-          s.block.kind === "function_declaration" ||
-          s.block.kind === "arrow_function_decl" ||
-          s.block.kind === "function_expression_decl"
-      )
-      .filter((s) => !overlapsExcluded(s.block));
-
-    // now slice to K and enforce budget (never cut)
-    const pickedC = this.selectWithinBudget(
-      similarAll.map((s) => s.block),
-      budgets.C
-    ).slice(0, TOP_K);
-
-    this.reserveRanges(pickedC); // reserve C
-
-    // ---- One-hop dependency closure only for B + C (never re-add A or duplicates) ----
-    const rangesBC = [
-      ...pickedB.map((b) => ({
-        startOffset: b.startOffset,
-        endOffset: b.endOffset,
-      })),
-      ...pickedC.map((c) => ({
-        startOffset: c.startOffset,
-        endOffset: c.endOffset,
-      })),
-    ];
-    const usedBC = rangesBC.reduce(
-      (s, r) => s + (r.endOffset - r.startOffset),
-      0
-    );
-    const bcBudgetLeft = Math.max(0, budgets.B + budgets.C - usedBC);
-
-    const depExpanded = this.expandWithDependencies(
-      [
-        ...pickedB.map((b) => b as BlockRange),
-        ...pickedC.map(
-          (c) => ({ ...c, node: c.node } as unknown as BlockRange)
-        ),
-      ],
-      globalIndex,
-      rangesBC,
-      bcBudgetLeft
-    )
-      // ensure we never add A or overlap with picked B/C
-      .filter((r) => !this.overlaps(r, baseRange))
-      .filter(
-        (r) =>
-          this.filterNonOverlapping([r], [...pickedB, ...pickedC]).length > 0
-      );
-
-    // ---- Tier D: Existing tests as skeletons (disjoint by *kind* from C) ----
-    // Because we filtered pm_test out of C, all tests live here as skeletons, excluding Tier A.
-    const testsExA = this.collectOtherTestBlocks(baseRange);
-    const existingTests = testsExA.length
-      ? testsExA.map((t) => this.renderTestSkeleton(t.node)).join("\n")
-      : "";
-
-    // ---- Build final strings ----
-    const linesAroundCursor = this.textFromRanges(linesAroundCursorRanges);
-
-    // Declarations = pickedB + any dep-expanded that are declarations
-    const declRanges = [
-      ...pickedB.map((b) => ({
-        startOffset: b.startOffset,
-        endOffset: b.endOffset,
-      })),
-      ...depExpanded.filter((r) =>
-        declOnly.some(
-          (g) => g.startOffset === r.startOffset && g.endOffset === r.endOffset
-        )
-      ),
-    ];
-    const declarations = this.getGlobalDeclarations(cursor, {
-      maxCharsBudget: 500,
+    // Step 3: Extract Tier A - Lines around cursor (40% of budget)
+    // Uses the first main extraction method with syntax-aware line selection
+    const linesAroundCursorResult = this.getContextAroundCursor(cursor, {
+      numberOfPrefixLines: opts.rawPrefixLines ?? 5,
+      numberOfSuffixLines: opts.rawSuffixLines ?? 5,
+      includeLeadingComments: opts.includeLeadingComments ?? true,
     });
 
-    const relevantRanges = pickedC.map((r) => ({
-      startOffset: r.startOffset,
-      endOffset: r.endOffset,
-    }));
-    const relevantLines = this.getRelevantBlocks(cursor, {
-      topK: 5,
-      minSimilarityThreshold: 0.05,
-      includeLeadingComments: true,
-      maxCharsBudget: 1500,
+    // Step 4: Extract Tier B - Global declarations (30% of budget)
+    // Uses the second main extraction method with priority-based selection
+    const declarationsResult = this.getGlobalDeclarations(cursor, {
+      maxCharsBudget: budgets.B,
+      includeLeadingComments: opts.includeLeadingComments ?? true,
     });
 
-    // ---- Emit ----
-    const res: ExtractRankedContextSections = {
-      linesAroundCursor,
-      declarations: declarations.text,
-      relevantLines: relevantLines.text,
+    // Step 5: Extract Tier C - Relevant blocks (20% of budget)
+    // Uses the third main extraction method with similarity-based selection
+    const relevantBlocksResult = this.getRelevantBlocks(cursor, {
+      topK: 3, // Limit to top 3 most similar blocks
+      minSimilarityThreshold: 0.05, // Minimum Jaccard similarity
+      maxCharsBudget: budgets.C,
+      includeLeadingComments: opts.includeLeadingComments ?? true,
+    });
+
+    // Step 6: Extract Tier D - Existing tests (10% of budget, currently placeholder)
+    // This tier is reserved for future extension with test skeleton extraction
+    const existingTests = ""; // Can be extended with test skeleton extraction
+
+    // Step 7: Populate debug information if requested by the user
+    if (opts.debug) {
+      debug.titleTokens = this.extractTitleTokens(cursor);
+      debug.queryTokens = this.buildQueryTokens(cursor);
+    }
+
+    // Step 8: Build the comprehensive result structure
+    const result: ExtractRankedContextSections = {
+      // Text content from each tier
+      linesAroundCursor: linesAroundCursorResult.text,
+      declarations: declarationsResult.text,
+      relevantLines: relevantBlocksResult.text,
       existingTests,
+
+      // Metadata for analysis and debugging
       meta: {
-        strategy: tierA.strategy,
+        strategy: linesAroundCursorResult.strategy,
         budgets,
+
+        // Offset information for highlighting in editors
         offsets: {
-          A: linesAroundCursorRanges,
-          B: declRanges,
-          C: relevantRanges,
-          D: [], // skeletons are synthetic
+          A: [
+            {
+              startOffset: linesAroundCursorResult.startOffset,
+              endOffset: linesAroundCursorResult.endOffset,
+            },
+          ],
+          B: declarationsResult.declarations.map((d) => ({
+            startOffset: d.startOffset,
+            endOffset: d.endOffset,
+          })),
+          C: relevantBlocksResult.blocks.map((b) => ({
+            startOffset: b.startOffset,
+            endOffset: b.endOffset,
+          })),
+          D: [], // No test skeletons currently
         },
+
+        // Count information for analytics
         pickedCounts: {
-          A: 1,
-          B: declRanges.length,
-          C: relevantRanges.length,
-          D: testsExA.length,
-          skeletons: testsExA.length,
+          A: 1, // Always exactly one range for lines around cursor
+          B: declarationsResult.declarations.length,
+          C: relevantBlocksResult.blocks.length,
+          D: 0, // No test skeletons currently
+          skeletons: 0,
         },
-        titleTokens,
+
+        titleTokens: debug.titleTokens,
       },
+
+      // Include debug information only if requested
       debug: opts.debug ? debug : undefined,
     };
 
+    // Step 9: Store debug information for later access via getLastDebug()
     this._lastDebug = opts.debug ? debug : null;
-    return res;
+
+    return result;
+  }
+
+  /**
+   * Extracts title tokens from the current editing context for debug information.
+   * Looks for test titles and function names near the cursor position.
+   *
+   * @param cursor Current cursor position
+   * @returns Array of title tokens
+   */
+  private extractTitleTokens(cursor: Position): string[] {
+    if (!this.tree) return [];
+
+    const nodeAtCursor = this.tree.rootNode.descendantForPosition({
+      row: cursor.lineNumber - 1,
+      column: cursor.column - 1,
+    });
+
+    const func = nodeAtCursor ? this.nearestFunctionFrom(nodeAtCursor) : null;
+    const container = func ? this.wrapFunctionIfArgument(func) : null;
+    const title = container ? this.getTestTitleFromNode(container) : null;
+
+    return this.tokenize(title);
   }
 }
